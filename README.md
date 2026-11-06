@@ -62,8 +62,8 @@ LICENSE_ADMIN_SECRET="..." python app.py
 
 ## Future: shopkeeper accounts + cloud sync (NOT in V3)
 
-The storage layer is already designed for it: `license_keys.user_id`
-(nullable) and a `users` table with the signup fields — full_name, phone,
+The storage layer is already designed for it: `psc_license_keys.user_id`
+(nullable) and a `psc_users` table with the signup fields — full_name, phone,
 post_office (address), email (Gmail). The next phase will add per-account
 data tables (bills, stock, ledger rows keyed by `user_id`) so a shopkeeper
 who logs back in after a device crash restores everything, plus `/v2/`

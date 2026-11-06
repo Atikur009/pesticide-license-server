@@ -1,11 +1,17 @@
 # Pesticide Shop Calculator — License Server (Render Blueprint)
 #
-# Render free tier. Creates ONE web service + ONE free Postgres database
-# (durable storage — survives restarts and redeploys; the free disk of a
-# Render web service is ephemeral and must NOT be relied on).
+# Render free tier. Creates ONE web service. It does NOT create a database:
+# Render allows only ONE free Postgres database per workspace and that slot
+# is already used by atikur-smm-panel-db (the SMM panel). So this service
+# shares that database — its tables are psc_-prefixed (psc_license_keys,
+# psc_users) and never collide with the panel's tables (users, services,
+# orders, ...). Durable storage — survives restarts and redeploys; the free
+# disk of a Render web service is ephemeral and must NOT be relied on.
 #
 # Required env vars (set in the Render dashboard after first deploy — they
 # are NEVER committed anywhere):
+#   DATABASE_URL          — INTERNAL connection string of atikur-smm-panel-db
+#                           (copy from that database's dashboard page)
 #   LICENSE_SIGNING_KEY   — the RSA-2048 private key PEM (whole file, newlines kept)
 #   LICENSE_ADMIN_SECRET  — the admin secret Atikur uses in keygen.html
 # Optional:
@@ -23,15 +29,7 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
     envVars:
-      - key: DATABASE_URL
-        fromDatabase:
-          name: pesticide-license-db
-          property: connectionString
       - key: LICENSE_SIGNING_KEY
         sync: false
       - key: LICENSE_ADMIN_SECRET
         sync: false
-
-databases:
-  - name: pesticide-license-db
-    plan: free

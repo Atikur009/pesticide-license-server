@@ -26,12 +26,14 @@ Secrets (Render env vars, NEVER in the repo):
   LICENSE_SIGNING_KEY   — RSA private key PEM (or base64 of it in
                           LICENSE_SIGNING_KEY_B64). Generated once; the public
                           half lives in server/public_key.pem and in the app.
-  DATABASE_URL          — set automatically by Render when the free Postgres
-                          database (render.yaml) is attached. Without it the
-                          server uses a local SQLite file (data/license.db).
+  DATABASE_URL          — set MANUALLY in the Render dashboard to the internal
+                          connection string of atikur-smm-panel-db (Render
+                          allows only one free Postgres DB; this service
+                          shares the panel's). Without it the server uses a
+                          local SQLite file (data/license.db).
 
 Next phase (NOT built here): shopkeeper accounts + cloud sync. The schema
-already has users + license_keys.user_id, and routes are /v1/ versioned, so
+already has psc_users + psc_license_keys.user_id, and routes are /v1/ versioned, so
 /v2/ can add them without a rewrite.
 """
 import base64

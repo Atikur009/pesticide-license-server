@@ -7,17 +7,17 @@ Storage backends (chosen at runtime):
 
 Schema is deliberately extensible for the NEXT phase (shopkeeper accounts +
 cloud sync — NOT built in V3):
-  * license_keys has a nullable user_id column (a key can later belong to a
+  * psc_license_keys has a nullable user_id column (a key can later belong to a
     shopkeeper account instead of only an install_id).
-  * a users table already exists — with the exact signup fields the next
+  * a psc_users table already exists — with the exact signup fields the next
     phase needs (full_name, phone, post_office/address, email/Gmail) — unused
     by V3 endpoints, reserved for the accounts phase.
   * the next phase will add per-account data tables (bills, stock, ledger
     rows keyed by user_id) so a shopkeeper who logs back in after a device
     crash restores everything — data must never be lost. Those tables are
-    NOT created here; the pattern to follow is the same as license_keys
+    NOT created here; the pattern to follow is the same as psc_license_keys
     (user_id column + created_at).
-  * API routes are versioned under /v1/ so /v2/ can add users/sync later
+  * API routes are versioned under /v1/ so /v2/ can add psc_users/sync later
     without breaking V3 clients.
 """
 import os
@@ -34,7 +34,7 @@ def _norm_key(raw):
     return re.sub(r"[^A-Z0-9]", "", str(raw or "").upper())
 
 SCHEMA_KEYS = """
-CREATE TABLE IF NOT EXISTS license_keys (
+CREATE TABLE IF NOT EXISTS psc_license_keys (
     key_id      TEXT PRIMARY KEY,
     license_key TEXT UNIQUE NOT NULL,
     install_id  TEXT,
@@ -42,11 +42,11 @@ CREATE TABLE IF NOT EXISTS license_keys (
     created_at  TEXT NOT NULL,
     activated_at TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_license_key ON license_keys(license_key);
+CREATE INDEX IF NOT EXISTS idx_psc_license_key ON psc_license_keys(license_key);
 """
 
 SCHEMA_USERS = """
-CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE IF NOT EXISTS psc_users (
     id          TEXT PRIMARY KEY,
     full_name   TEXT,
     phone       TEXT,
@@ -76,7 +76,7 @@ class SQLiteStore:
     def create_key(self, key_id, license_key, install_id):
         with self._lock:
             self._conn.execute(
-                "INSERT INTO license_keys (key_id, license_key, install_id, user_id, created_at, activated_at)"
+                "INSERT INTO psc_license_keys (key_id, license_key, install_id, user_id, created_at, activated_at)"
                 " VALUES (?, ?, ?, NULL, ?, NULL)",
                 (key_id, _norm_key(license_key), install_id, _now_iso()))
             self._conn.commit()
@@ -84,30 +84,30 @@ class SQLiteStore:
     def get_key(self, license_key):
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM license_keys WHERE license_key = ?",
+                "SELECT * FROM psc_license_keys WHERE license_key = ?",
                 (_norm_key(license_key),)).fetchone()
         return dict(row) if row else None
 
     def bind_key(self, key_id, install_id):
         with self._lock:
             self._conn.execute(
-                "UPDATE license_keys SET install_id = ?, activated_at = ? WHERE key_id = ?",
+                "UPDATE psc_license_keys SET install_id = ?, activated_at = ? WHERE key_id = ?",
                 (install_id, _now_iso(), key_id))
             self._conn.commit()
 
     def list_keys(self):
         with self._lock:
             rows = self._conn.execute(
-                "SELECT * FROM license_keys ORDER BY created_at DESC").fetchall()
+                "SELECT * FROM psc_license_keys ORDER BY created_at DESC").fetchall()
         return [dict(r) for r in rows]
 
     def export_all(self):
         with self._lock:
             keys = [dict(r) for r in self._conn.execute(
-                "SELECT * FROM license_keys ORDER BY created_at").fetchall()]
-            users = [dict(r) for r in self._conn.execute(
-                "SELECT * FROM users ORDER BY created_at").fetchall()]
-        return {"keys": keys, "users": users}
+                "SELECT * FROM psc_license_keys ORDER BY created_at").fetchall()]
+            psc_users = [dict(r) for r in self._conn.execute(
+                "SELECT * FROM psc_users ORDER BY created_at").fetchall()]
+        return {"keys": keys, "psc_users": psc_users}
 
 
 class PostgresStore:
@@ -137,7 +137,7 @@ class PostgresStore:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO license_keys (key_id, license_key, install_id, user_id, created_at, activated_at)"
+                    "INSERT INTO psc_license_keys (key_id, license_key, install_id, user_id, created_at, activated_at)"
                     " VALUES (%s, %s, %s, NULL, %s, NULL)",
                     (key_id, _norm_key(license_key), install_id, _now_iso()))
             conn.commit()
@@ -148,7 +148,7 @@ class PostgresStore:
         conn = self._connect()
         try:
             with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
-                cur.execute("SELECT * FROM license_keys WHERE license_key = %s",
+                cur.execute("SELECT * FROM psc_license_keys WHERE license_key = %s",
                             (_norm_key(license_key),))
                 row = cur.fetchone()
             return dict(row) if row else None
@@ -160,7 +160,7 @@ class PostgresStore:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE license_keys SET install_id = %s, activated_at = %s WHERE key_id = %s",
+                    "UPDATE psc_license_keys SET install_id = %s, activated_at = %s WHERE key_id = %s",
                     (install_id, _now_iso(), key_id))
             conn.commit()
         finally:
@@ -170,7 +170,7 @@ class PostgresStore:
         conn = self._connect()
         try:
             with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
-                cur.execute("SELECT * FROM license_keys ORDER BY created_at DESC")
+                cur.execute("SELECT * FROM psc_license_keys ORDER BY created_at DESC")
                 return [dict(r) for r in cur.fetchall()]
         finally:
             conn.close()
@@ -179,11 +179,11 @@ class PostgresStore:
         conn = self._connect()
         try:
             with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
-                cur.execute("SELECT * FROM license_keys ORDER BY created_at")
+                cur.execute("SELECT * FROM psc_license_keys ORDER BY created_at")
                 keys = [dict(r) for r in cur.fetchall()]
-                cur.execute("SELECT * FROM users ORDER BY created_at")
-                users = [dict(r) for r in cur.fetchall()]
-            return {"keys": keys, "users": users}
+                cur.execute("SELECT * FROM psc_users ORDER BY created_at")
+                psc_users = [dict(r) for r in cur.fetchall()]
+            return {"keys": keys, "psc_users": psc_users}
         finally:
             conn.close()
 
