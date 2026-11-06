@@ -1,0 +1,37 @@
+# Pesticide Shop Calculator — License Server (Render Blueprint)
+#
+# Render free tier. Creates ONE web service + ONE free Postgres database
+# (durable storage — survives restarts and redeploys; the free disk of a
+# Render web service is ephemeral and must NOT be relied on).
+#
+# Required env vars (set in the Render dashboard after first deploy — they
+# are NEVER committed anywhere):
+#   LICENSE_SIGNING_KEY   — the RSA-2048 private key PEM (whole file, newlines kept)
+#   LICENSE_ADMIN_SECRET  — the admin secret Atikur uses in keygen.html
+# Optional:
+#   LICENSE_DB_PATH       — only used if DATABASE_URL is not set (local dev)
+#
+# After deploy, in the Render dashboard set a custom domain
+# license.atikur.cyou -> this service (Cloudflare CNAME), or use the
+# *.onrender.com URL as the app's API base URL.
+
+services:
+  - type: web
+    name: pesticide-license-server
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: pesticide-license-db
+          property: connectionString
+      - key: LICENSE_SIGNING_KEY
+        sync: false
+      - key: LICENSE_ADMIN_SECRET
+        sync: false
+
+databases:
+  - name: pesticide-license-db
+    plan: free

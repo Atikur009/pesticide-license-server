@@ -1,0 +1,5 @@
+# data/ — local dev SQLite database (never committed; production uses Postgres)
+data/
+__pycache__/
+*.pyc
+.venv/
