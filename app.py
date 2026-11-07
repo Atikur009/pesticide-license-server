@@ -380,7 +380,8 @@ def start_trial():
         store.create_trial(install_id, user_id, now, expires_at)
     token = sign_token(install_id, None, token_type="trial", exp=expires_at,
                        extra={"user_id": user_id})
-    days_left = max(0, (expires_at - now + 86399) // 86400)
+    # Clamp: a 3-day trial must never report more than 3 days left.
+    days_left = min(TRIAL_DAYS, max(0, (expires_at - now + 86399) // 86400))
     return jsonify({"token": token, "install_id": install_id,
                     "user_id": user_id,
                     "expires_at": expires_at, "days_left": days_left})
