@@ -56,16 +56,18 @@ CREATE TABLE IF NOT EXISTS psc_users (
 );
 """
 
-# 3-day free trial (v3.1.0): ONE trial per ACCOUNT (user_id). The install_id
-# column records which device started it. Starting again never extends:
-# the same account always gets its ORIGINAL expiry. A new account on a
-# new device is the only way to a fresh trial — that is the known limit
-# of a trial without hardware fingerprinting; the paid key (one key = one
-# device, server-bound) is what protects revenue.
+# 3-day free trial (v3.1.0): ONE trial per ACCOUNT — user_id is the PRIMARY
+# KEY. install_id records which device started it. Starting again never
+# extends: the same account always gets its ORIGINAL expiry. A new account
+# on a new device is the only way to a fresh trial — that is the known
+# limit of a trial without hardware fingerprinting; the paid key (one key
+# = one device, server-bound) is what protects revenue.
+# NOTE: the first v3.1.0 deploy created this table keyed by install_id;
+# both stores migrate it to user_id on startup (see __init__).
 SCHEMA_TRIALS = """
 CREATE TABLE IF NOT EXISTS psc_trials (
-    install_id TEXT PRIMARY KEY,
-    user_id    TEXT,
+    user_id    TEXT PRIMARY KEY,
+    install_id TEXT,
     started_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL,
     created_at TEXT NOT NULL
@@ -87,6 +89,22 @@ class SQLiteStore:
         with self._lock:
             self._conn.executescript(SCHEMA_KEYS + SCHEMA_USERS + SCHEMA_TRIALS)
             self._conn.commit()
+            # Migrate pre-fix trials table (PK was install_id) to PK user_id.
+            row = self._conn.execute(
+                "SELECT name FROM pragma_table_info('psc_trials') WHERE pk = 1").fetchone()
+            if row and row[0] == 'install_id':
+                self._conn.executescript("""
+                    DELETE FROM psc_trials WHERE user_id IS NULL;
+                    CREATE TABLE psc_trials_new (
+                        user_id TEXT PRIMARY KEY, install_id TEXT,
+                        started_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+                        created_at TEXT NOT NULL);
+                    INSERT INTO psc_trials_new (user_id, install_id, started_at, expires_at, created_at)
+                        SELECT user_id, install_id, started_at, expires_at, created_at FROM psc_trials;
+                    DROP TABLE psc_trials;
+                    ALTER TABLE psc_trials_new RENAME TO psc_trials;
+                """)
+                self._conn.commit()
         self.backend = "sqlite"
 
     def get_key_by_install_id(self, install_id):
@@ -191,6 +209,25 @@ class PostgresStore:
                 cur.execute(SCHEMA_KEYS)
                 cur.execute(SCHEMA_USERS)
                 cur.execute(SCHEMA_TRIALS)
+            conn.commit()
+            # Migrate pre-fix trials table (PK was install_id) to PK user_id.
+            from psycopg2 import sql as _sql
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT tc.constraint_name FROM information_schema.table_constraints tc "
+                    "WHERE tc.table_name = 'psc_trials' AND tc.constraint_type = 'PRIMARY KEY'")
+                pkrow = cur.fetchone()
+                if pkrow:
+                    cur.execute(
+                        "SELECT column_name FROM information_schema.key_column_usage "
+                        "WHERE table_name = 'psc_trials' AND constraint_name = %s",
+                        (pkrow[0],))
+                    pk_cols = [r[0] for r in cur.fetchall()]
+                    if pk_cols == ['install_id']:
+                        cur.execute("DELETE FROM psc_trials WHERE user_id IS NULL")
+                        cur.execute(_sql.SQL("ALTER TABLE psc_trials DROP CONSTRAINT {}").format(
+                            _sql.Identifier(pkrow[0])))
+                        cur.execute("ALTER TABLE psc_trials ADD PRIMARY KEY (user_id)")
             conn.commit()
         finally:
             conn.close()
