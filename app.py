@@ -12,6 +12,25 @@ Endpoints (all JSON):
                                    install_id on first use; rejects a key
                                    already bound to a different install_id.
                                    Returns {token, key_id, install_id}.
+  POST /v1/signup               -> {full_name, phone, post_office, email}.
+                                   Creates a shopkeeper account (one per
+                                   Gmail) and returns a 30-day session token.
+  POST /v1/login                -> {email, phone}. Returns the account + a
+                                   fresh 30-day session token. The session
+                                   token (type "session") goes in the
+                                   Authorization: Bearer header for trial.
+  POST /v1/start-trial           -> {install_id} + session. Starts a 3-day FREE trial
+                                   (v3.1.0): one trial per install_id, recorded
+                                   in psc_trials. Returns a signed TRIAL token
+                                   {token, install_id, expires_at, days_left}.
+                                   Re-starting never extends the original
+                                   expiry; a device with a paid key gets 409
+                                   already_licensed. Trial token payload has
+                                   "type": "trial" and "exp" (unix seconds);
+                                   the app verifies the signature offline and
+                                   locks again after expiry. Reinstalling the
+                                   app creates a new install_id and therefore
+                                   a new trial — known limit, see store.py.
   GET  /v1/keys                 -> admin only. Lists issued keys + bindings.
   GET  /v1/export               -> admin only. Full JSON backup dump.
 
@@ -49,8 +68,12 @@ from flask import Flask, jsonify, request
 
 from store import get_store
 
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 KEY_ALPHABET = string.ascii_uppercase + string.digits
+TRIAL_DAYS = 3
+TRIAL_SECONDS = TRIAL_DAYS * 86400
+SESSION_DAYS = 30
+SESSION_SECONDS = SESSION_DAYS * 86400
 
 app = Flask(__name__)
 store = get_store()
@@ -88,16 +111,48 @@ def _b64url_decode(s: str) -> bytes:
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
-def sign_token(install_id: str, key_id: str) -> str:
+def _sign_payload(payload: dict) -> str:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
-    payload = {"install_id": install_id, "key_id": key_id, "iat": int(time.time())}
     payload_b64 = _b64url(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
     sig = _SIGNING_KEY.sign(
         payload_b64.encode("ascii"),
         padding.PKCS1v15(),
         hashes.SHA256())
     return payload_b64 + "." + _b64url(sig)
+
+
+def _verify_token(token):
+    """Verify one of our own signed tokens (license / trial / session).
+    Returns the payload dict, or None if the signature or shape is bad."""
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        parts = str(token or "").split(".")
+        if len(parts) != 2:
+            return None
+        payload_b64, sig_b64 = parts
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+        if not isinstance(payload, dict) or "iat" not in payload:
+            return None
+        _SIGNING_KEY.public_key().verify(
+            _b64url_decode(sig_b64),
+            payload_b64.encode("ascii"),
+            padding.PKCS1v15(),
+            hashes.SHA256())
+        return payload
+    except Exception:
+        return None
+
+
+def sign_token(install_id: str, key_id: str, token_type: str = "license", exp=None, extra=None) -> str:
+    payload = {"install_id": install_id, "key_id": key_id,
+               "iat": int(time.time()), "type": token_type}
+    if exp is not None:
+        payload["exp"] = int(exp)
+    if extra:
+        payload.update(extra)
+    return _sign_payload(payload)
 
 
 def public_key_pem() -> str:
@@ -123,6 +178,42 @@ def _new_key() -> str:
 
 def _new_key_id() -> str:
     return "K-" + "".join(secrets.choice(KEY_ALPHABET) for _ in range(8))
+
+
+def _new_user_id() -> str:
+    return "U-" + "".join(secrets.choice(KEY_ALPHABET) for _ in range(8))
+
+
+def _norm_email(raw) -> str:
+    return str(raw or "").strip().lower()
+
+
+def _norm_phone(raw) -> str:
+    return re.sub(r"[^0-9+]", "", str(raw or "").strip())
+
+
+def _session_user():
+    """The logged-in shopkeeper from the Authorization: Bearer session
+    token, or None. A session lasts 30 days, then the user logs in again."""
+    auth = request.headers.get("Authorization") or ""
+    if not auth.startswith("Bearer "):
+        return None
+    payload = _verify_token(auth[7:].strip())
+    if not payload or payload.get("type") != "session":
+        return None
+    exp = payload.get("exp")
+    if not isinstance(exp, (int, float)) or exp <= time.time():
+        return None
+    if not payload.get("user_id"):
+        return None
+    return payload
+
+
+def _new_session(user_id, email):
+    now = int(time.time())
+    return _sign_payload({"user_id": user_id, "email": email,
+                          "type": "session", "iat": now,
+                          "exp": now + SESSION_SECONDS})
 
 
 # Light brute-force guard on activation: 30 attempts per IP per 10 minutes.
@@ -202,6 +293,97 @@ def activate():
     token = sign_token(install_id, rec["key_id"])
     return jsonify({"token": token, "key_id": rec["key_id"],
                     "install_id": install_id})
+
+
+@app.route("/v1/signup", methods=["POST"])
+def signup():
+    """Create a shopkeeper account: full name + phone + post office + Gmail.
+    One account per Gmail. Returns the account + a 30-day session token."""
+    if _rate_limited():
+        return jsonify({"error": "too_many_attempts",
+                        "message": "অনেকবার চেষ্টা করা হয়েছে — কিছুক্ষণ পরে আবার চেষ্টা করুন।"}), 429
+    body = request.get_json(silent=True) or {}
+    full_name = (body.get("full_name") or "").strip()
+    phone = _norm_phone(body.get("phone"))
+    post_office = (body.get("post_office") or "").strip()
+    email = _norm_email(body.get("email"))
+    if not full_name or not phone or not post_office or not email:
+        return jsonify({"error": "missing_fields",
+                        "message": "নাম, মোবাইল নম্বর, পোস্ট অফিস ও Gmail — সবগুলো লাগবে।"}), 400
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return jsonify({"error": "invalid_email",
+                        "message": "সঠিক Gmail ঠিকানা দিন।"}), 400
+    if store.get_user_by_email(email):
+        return jsonify({"error": "account_exists",
+                        "message": "এই Gmail দিয়ে অ্যাকাউন্ট আছে — লগইন করুন।"}), 409
+    user_id = _new_user_id()
+    store.create_user(user_id, full_name, phone, post_office, email)
+    return jsonify({"user_id": user_id, "full_name": full_name,
+                    "phone": phone, "post_office": post_office,
+                    "email": email,
+                    "session_token": _new_session(user_id, email)}), 201
+
+
+@app.route("/v1/login", methods=["POST"])
+def login():
+    """Log in with Gmail + phone (the two the shopkeeper gave at signup).
+    Returns the account + a fresh 30-day session token."""
+    if _rate_limited():
+        return jsonify({"error": "too_many_attempts",
+                        "message": "অনেকবার চেষ্টা করা হয়েছে — কিছুক্ষণ পরে আবার চেষ্টা করুন।"}), 429
+    body = request.get_json(silent=True) or {}
+    email = _norm_email(body.get("email"))
+    phone = _norm_phone(body.get("phone"))
+    if not email or not phone:
+        return jsonify({"error": "missing_fields",
+                        "message": "Gmail ও মোবাইল নম্বর — দুটোই লাগবে।"}), 400
+    user = store.get_user_by_email(email)
+    if not user:
+        return jsonify({"error": "account_not_found",
+                        "message": "এই Gmail দিয়ে অ্যাকাউন্ট পাওয়া যায়নি — সাইন আপ করুন।"}), 404
+    if _norm_phone(user.get("phone")) != phone:
+        return jsonify({"error": "wrong_phone",
+                        "message": "মোবাইল নম্বর মেলেনি — সাইন আপের সময় দেওয়া নম্বরটি দিন।"}), 403
+    return jsonify({"user_id": user["id"], "full_name": user.get("full_name"),
+                    "phone": user.get("phone"),
+                    "post_office": user.get("post_office"),
+                    "email": email,
+                    "session_token": _new_session(user["id"], email)})
+
+
+@app.route("/v1/start-trial", methods=["POST"])
+def start_trial():
+    if _rate_limited():
+        return jsonify({"error": "too_many_attempts",
+                        "message": "অনেকবার চেষ্টা করা হয়েছে — কিছুক্ষণ পরে আবার চেষ্টা করুন।"}), 429
+    sess = _session_user()
+    if not sess:
+        return jsonify({"error": "unauthorized",
+                        "message": "প্রথমে লগইন করুন — ট্রায়াল শুরু করতে অ্যাকাউন্ট লাগবে।"}), 401
+    user_id = sess["user_id"]
+    body = request.get_json(silent=True) or {}
+    install_id = (body.get("install_id") or "").strip().upper()
+    if not install_id:
+        return jsonify({"error": "missing_fields",
+                        "message": "Install ID লাগবে।"}), 400
+    # A device that already owns a paid key needs no trial.
+    if store.get_key_by_install_id(install_id):
+        return jsonify({"error": "already_licensed",
+                        "message": "এই ডিভাইসে লাইসেন্স আছে — ট্রায়াল লাগবে না।"}), 409
+    now = int(time.time())
+    trial = store.get_trial_by_user(user_id)
+    if trial:
+        # One trial per account — never extend the original expiry.
+        expires_at = int(trial["expires_at"])
+    else:
+        expires_at = now + TRIAL_SECONDS
+        store.create_trial(install_id, user_id, now, expires_at)
+    token = sign_token(install_id, None, token_type="trial", exp=expires_at,
+                       extra={"user_id": user_id})
+    days_left = max(0, (expires_at - now + 86399) // 86400)
+    return jsonify({"token": token, "install_id": install_id,
+                    "user_id": user_id,
+                    "expires_at": expires_at, "days_left": days_left})
 
 
 @app.route("/v1/keys", methods=["GET"])

@@ -56,6 +56,22 @@ CREATE TABLE IF NOT EXISTS psc_users (
 );
 """
 
+# 3-day free trial (v3.1.0): ONE trial per ACCOUNT (user_id). The install_id
+# column records which device started it. Starting again never extends:
+# the same account always gets its ORIGINAL expiry. A new account on a
+# new device is the only way to a fresh trial — that is the known limit
+# of a trial without hardware fingerprinting; the paid key (one key = one
+# device, server-bound) is what protects revenue.
+SCHEMA_TRIALS = """
+CREATE TABLE IF NOT EXISTS psc_trials (
+    install_id TEXT PRIMARY KEY,
+    user_id    TEXT,
+    started_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+"""
+
 
 def _now_iso():
     from datetime import datetime, timezone
@@ -69,9 +85,59 @@ class SQLiteStore:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
-            self._conn.executescript(SCHEMA_KEYS + SCHEMA_USERS)
+            self._conn.executescript(SCHEMA_KEYS + SCHEMA_USERS + SCHEMA_TRIALS)
             self._conn.commit()
         self.backend = "sqlite"
+
+    def get_key_by_install_id(self, install_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM psc_license_keys WHERE install_id = ?",
+                (install_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_trial_by_user(self, user_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM psc_trials WHERE user_id = ?",
+                (user_id,)).fetchone()
+        return dict(row) if row else None
+
+    def create_trial(self, install_id, user_id, started_at, expires_at):
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO psc_trials (install_id, user_id, started_at, expires_at, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (install_id, user_id, started_at, expires_at, _now_iso()))
+            self._conn.commit()
+
+    def list_trials(self):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM psc_trials ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def create_user(self, user_id, full_name, phone, post_office, email):
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO psc_users (id, full_name, phone, post_office, email, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, full_name, phone, post_office, email, _now_iso()))
+            self._conn.commit()
+
+    def get_user_by_email(self, email):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM psc_users WHERE email = ?",
+                (email,)).fetchone()
+        return dict(row) if row else None
+
+    def get_user_by_id(self, user_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM psc_users WHERE id = ?",
+                (user_id,)).fetchone()
+        return dict(row) if row else None
 
     def create_key(self, key_id, license_key, install_id):
         with self._lock:
@@ -107,7 +173,9 @@ class SQLiteStore:
                 "SELECT * FROM psc_license_keys ORDER BY created_at").fetchall()]
             psc_users = [dict(r) for r in self._conn.execute(
                 "SELECT * FROM psc_users ORDER BY created_at").fetchall()]
-        return {"keys": keys, "psc_users": psc_users}
+            trials = [dict(r) for r in self._conn.execute(
+                "SELECT * FROM psc_trials ORDER BY created_at").fetchall()]
+        return {"keys": keys, "psc_users": psc_users, "trials": trials}
 
 
 class PostgresStore:
@@ -122,10 +190,88 @@ class PostgresStore:
             with conn.cursor() as cur:
                 cur.execute(SCHEMA_KEYS)
                 cur.execute(SCHEMA_USERS)
+                cur.execute(SCHEMA_TRIALS)
             conn.commit()
         finally:
             conn.close()
         self.backend = "postgres"
+
+    def get_key_by_install_id(self, install_id):
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM psc_license_keys WHERE install_id = %s",
+                            (install_id,))
+                row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_trial_by_user(self, user_id):
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM psc_trials WHERE user_id = %s",
+                            (user_id,))
+                row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def create_trial(self, install_id, user_id, started_at, expires_at):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO psc_trials (install_id, user_id, started_at, expires_at, created_at)"
+                    " VALUES (%s, %s, %s, %s, %s)",
+                    (install_id, user_id, started_at, expires_at, _now_iso()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_trials(self):
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM psc_trials ORDER BY created_at DESC")
+                return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def create_user(self, user_id, full_name, phone, post_office, email):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO psc_users (id, full_name, phone, post_office, email, created_at)"
+                    " VALUES (%s, %s, %s, %s, %s, %s)",
+                    (user_id, full_name, phone, post_office, email, _now_iso()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_user_by_email(self, email):
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM psc_users WHERE email = %s",
+                            (email,))
+                row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_user_by_id(self, user_id):
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM psc_users WHERE id = %s",
+                            (user_id,))
+                row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
 
     def _connect(self):
         conn = self._psycopg2.connect(self._dsn)
@@ -183,7 +329,9 @@ class PostgresStore:
                 keys = [dict(r) for r in cur.fetchall()]
                 cur.execute("SELECT * FROM psc_users ORDER BY created_at")
                 psc_users = [dict(r) for r in cur.fetchall()]
-            return {"keys": keys, "psc_users": psc_users}
+                cur.execute("SELECT * FROM psc_trials ORDER BY created_at")
+                trials = [dict(r) for r in cur.fetchall()]
+            return {"keys": keys, "psc_users": psc_users, "trials": trials}
         finally:
             conn.close()
 
