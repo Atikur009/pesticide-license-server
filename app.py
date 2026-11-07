@@ -235,8 +235,12 @@ def _rate_limited() -> bool:
 def _cors(resp):
     # The desktop app (file://) and Android WebView fetch this API — CORS
     # must allow them. The API is key-checked; origin is not a secret.
+    # Authorization MUST be listed: /v1/start-trial sends a Bearer session
+    # token, and without it the browser's preflight fails — the app then
+    # reports "no internet" even though the network is fine (seen live
+    # 2026-11-07: login worked, trial failed, same phone, same server).
     resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Secret"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Secret, Authorization"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return resp
 
