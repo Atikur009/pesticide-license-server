@@ -98,9 +98,29 @@ CREATE TABLE IF NOT EXISTS psc_users (
     phone       TEXT,
     post_office TEXT,
     email       TEXT,
+    password_hash TEXT,
     banned      INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL
 );
+"""
+
+# Email verification codes (v3.3.0): one row per issued code. The code
+# itself is NEVER stored — only its SHA-256 hash. `payload` holds the
+# pending signup fields (JSON) so the account is created only AFTER the
+# code is verified; login/reset rows carry no payload. Rows are deleted
+# on use and pruned when expired.
+SCHEMA_VERIFICATIONS = """
+CREATE TABLE IF NOT EXISTS psc_verifications (
+    id          TEXT PRIMARY KEY,
+    email       TEXT NOT NULL,
+    purpose     TEXT NOT NULL,
+    code_hash   TEXT NOT NULL,
+    payload     TEXT,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    expires_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_psc_verif_email ON psc_verifications(email);
 """
 
 # 3-day free trial (v3.1.0): ONE trial per ACCOUNT — user_id is the PRIMARY
@@ -134,7 +154,7 @@ class SQLiteStore:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
-            self._conn.executescript(SCHEMA_KEYS + SCHEMA_USERS + SCHEMA_TRIALS)
+            self._conn.executescript(SCHEMA_KEYS + SCHEMA_USERS + SCHEMA_TRIALS + SCHEMA_VERIFICATIONS)
             self._conn.commit()
             # Migrate pre-fix trials table (PK was install_id) to PK user_id.
             row = self._conn.execute(
@@ -158,6 +178,9 @@ class SQLiteStore:
             if 'banned' not in cols:
                 self._conn.execute(
                     "ALTER TABLE psc_users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
+            if 'password_hash' not in cols:
+                self._conn.execute(
+                    "ALTER TABLE psc_users ADD COLUMN password_hash TEXT")
             rows = self._conn.execute(
                 "SELECT id, email FROM psc_users ORDER BY created_at ASC, id ASC").fetchall()
             for _id, new_email in _dedupe_emails([(r[0], r[1]) for r in rows]).items():
@@ -200,18 +223,68 @@ class SQLiteStore:
                 "SELECT * FROM psc_trials ORDER BY created_at DESC").fetchall()
         return [dict(r) for r in rows]
 
-    def create_user(self, user_id, full_name, phone, post_office, email):
+    def create_user(self, user_id, full_name, phone, post_office, email, password_hash=None):
         try:
             with self._lock:
                 self._conn.execute(
-                    "INSERT INTO psc_users (id, full_name, phone, post_office, email, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (user_id, full_name, phone, post_office, email, _now_iso()))
+                    "INSERT INTO psc_users (id, full_name, phone, post_office, email, password_hash, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, full_name, phone, post_office, email, password_hash, _now_iso()))
                 self._conn.commit()
             return True
         except sqlite3.IntegrityError:
             # Unique-email race: another signup for this mailbox just landed.
             return False
+
+    def set_password_hash(self, user_id, password_hash):
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE psc_users SET password_hash = ? WHERE id = ?",
+                (password_hash, user_id))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def create_verification(self, ver_id, email, purpose, code_hash, payload, expires_at):
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM psc_verifications WHERE expires_at < strftime('%s', 'now')")
+            self._conn.execute(
+                "INSERT INTO psc_verifications (id, email, purpose, code_hash, payload, attempts, created_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+                (ver_id, email, purpose, code_hash, payload, _now_iso(), expires_at))
+            self._conn.commit()
+
+    def get_verification(self, email, purpose):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM psc_verifications WHERE email = ? AND purpose = ?"
+                " ORDER BY created_at DESC, id DESC LIMIT 1",
+                (email, purpose)).fetchone()
+        return dict(row) if row else None
+
+    def delete_verifications(self, email, purpose):
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM psc_verifications WHERE email = ? AND purpose = ?",
+                (email, purpose))
+            self._conn.commit()
+
+    def bump_attempts(self, ver_id):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE psc_verifications SET attempts = attempts + 1 WHERE id = ?",
+                (ver_id,))
+            row = self._conn.execute(
+                "SELECT attempts FROM psc_verifications WHERE id = ?", (ver_id,)).fetchone()
+            self._conn.commit()
+        return int(row[0]) if row else 0
+
+    def count_recent_codes(self, email, since_iso):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM psc_verifications WHERE email = ? AND created_at >= ?",
+                (email, since_iso)).fetchone()
+        return int(row[0]) if row else 0
 
     def get_user_by_email(self, email):
         with self._lock:
@@ -278,6 +351,8 @@ class SQLiteStore:
                 "SELECT * FROM psc_users ORDER BY created_at").fetchall()]
             trials = [dict(r) for r in self._conn.execute(
                 "SELECT * FROM psc_trials ORDER BY created_at").fetchall()]
+        for u in psc_users:
+            u.pop("password_hash", None)  # password hashes never leave the DB
         return {"keys": keys, "psc_users": psc_users, "trials": trials}
 
 
@@ -294,6 +369,7 @@ class PostgresStore:
                 cur.execute(SCHEMA_KEYS)
                 cur.execute(SCHEMA_USERS)
                 cur.execute(SCHEMA_TRIALS)
+                cur.execute(SCHEMA_VERIFICATIONS)
             conn.commit()
             # Migrate pre-fix trials table (PK was install_id) to PK user_id.
             from psycopg2 import sql as _sql
@@ -318,6 +394,8 @@ class PostgresStore:
             with conn.cursor() as cur:
                 cur.execute(
                     "ALTER TABLE psc_users ADD COLUMN IF NOT EXISTS banned INTEGER NOT NULL DEFAULT 0")
+                cur.execute(
+                    "ALTER TABLE psc_users ADD COLUMN IF NOT EXISTS password_hash TEXT")
                 cur.execute(
                     "SELECT id, email FROM psc_users ORDER BY created_at ASC, id ASC")
                 rows = cur.fetchall()
@@ -384,20 +462,100 @@ class PostgresStore:
         finally:
             conn.close()
 
-    def create_user(self, user_id, full_name, phone, post_office, email):
+    def create_user(self, user_id, full_name, phone, post_office, email, password_hash=None):
         conn = self._connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO psc_users (id, full_name, phone, post_office, email, created_at)"
-                    " VALUES (%s, %s, %s, %s, %s, %s)",
-                    (user_id, full_name, phone, post_office, email, _now_iso()))
+                    "INSERT INTO psc_users (id, full_name, phone, post_office, email, password_hash, created_at)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (user_id, full_name, phone, post_office, email, password_hash, _now_iso()))
             conn.commit()
             return True
         except self._psycopg2.IntegrityError:
             # Unique-email race: another signup for this mailbox just landed.
             conn.rollback()
             return False
+        finally:
+            conn.close()
+
+    def set_password_hash(self, user_id, password_hash):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE psc_users SET password_hash = %s WHERE id = %s",
+                    (password_hash, user_id))
+                changed = cur.rowcount > 0
+            conn.commit()
+            return changed
+        finally:
+            conn.close()
+
+    def create_verification(self, ver_id, email, purpose, code_hash, payload, expires_at):
+        conn = self._connect()
+        try:
+            import time as _time
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM psc_verifications WHERE expires_at < %s",
+                    (int(_time.time()),))
+                cur.execute(
+                    "INSERT INTO psc_verifications (id, email, purpose, code_hash, payload, attempts, created_at, expires_at)"
+                    " VALUES (%s, %s, %s, %s, %s, 0, %s, %s)",
+                    (ver_id, email, purpose, code_hash, payload, _now_iso(), expires_at))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_verification(self, email, purpose):
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM psc_verifications WHERE email = %s AND purpose = %s"
+                    " ORDER BY created_at DESC, id DESC LIMIT 1",
+                    (email, purpose))
+                row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def delete_verifications(self, email, purpose):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM psc_verifications WHERE email = %s AND purpose = %s",
+                    (email, purpose))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def bump_attempts(self, ver_id):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE psc_verifications SET attempts = attempts + 1 WHERE id = %s",
+                    (ver_id,))
+                cur.execute(
+                    "SELECT attempts FROM psc_verifications WHERE id = %s", (ver_id,))
+                row = cur.fetchone()
+            conn.commit()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    def count_recent_codes(self, email, since_iso):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM psc_verifications WHERE email = %s AND created_at >= %s",
+                    (email, since_iso))
+                row = cur.fetchone()
+            return int(row[0]) if row else 0
         finally:
             conn.close()
 
@@ -504,6 +662,8 @@ class PostgresStore:
                 psc_users = [dict(r) for r in cur.fetchall()]
                 cur.execute("SELECT * FROM psc_trials ORDER BY created_at")
                 trials = [dict(r) for r in cur.fetchall()]
+            for u in psc_users:
+                u.pop("password_hash", None)  # password hashes never leave the DB
             return {"keys": keys, "psc_users": psc_users, "trials": trials}
         finally:
             conn.close()

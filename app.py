@@ -12,13 +12,27 @@ Endpoints (all JSON):
                                    install_id on first use; rejects a key
                                    already bound to a different install_id.
                                    Returns {token, key_id, install_id}.
-  POST /v1/signup               -> {full_name, phone, post_office, email}.
-                                   Creates a shopkeeper account (one per
-                                   Gmail) and returns a 30-day session token.
-  POST /v1/login                -> {email, phone}. Returns the account + a
-                                   fresh 30-day session token. The session
-                                   token (type "session") goes in the
-                                   Authorization: Bearer header for trial.
+  POST /v1/signup               -> {full_name, phone, post_office, email,
+                                   password}. Validates and EMAILS a 6-digit
+                                   code; the account is created only when the
+                                   code is verified (verify-signup). One
+                                   account per Gmail (canonical mailbox form).
+  POST /v1/verify-signup        -> {email, code}. Creates the account and
+                                   returns a 30-day session token.
+  POST /v1/login                -> {email, password?, phone?}. Accounts WITH
+                                   a password need the password; legacy
+                                   accounts WITHOUT one need the phone given
+                                   at signup. On success EMAILS a code; the
+                                   session comes from verify-login.
+  POST /v1/verify-login         -> {email, code}. Returns the account + a
+                                   fresh 30-day session token.
+  POST /v1/request-code         -> {email, purpose=signup|login|reset}.
+                                   (Re)sends a code. 60s cooldown, 5/hour
+                                   per mailbox. For signup it reuses the
+                                   pending signup details from the first call.
+  POST /v1/reset-password       -> {email, code, new_password}. Sets a new
+                                   password after an emailed code (forgot /
+                                   change-password flow).
   POST /v1/start-trial           -> {install_id} + session. Starts a 3-day FREE trial
                                    (v3.1.0): one trial per install_id, recorded
                                    in psc_trials. Returns a signed TRIAL token
@@ -57,12 +71,17 @@ Secrets (Render env vars, NEVER in the repo):
                           allows only one free Postgres DB; this service
                           shares the panel's). Without it the server uses a
                           local SQLite file (data/license.db).
+  SMTP_USER / SMTP_APP_PASSWORD — Gmail address + app password that sends
+                          the verification codes (see mailer.py). Without
+                          them the auth endpoints report email_unconfigured.
 
 Next phase (NOT built here): shopkeeper accounts + cloud sync. The schema
 already has psc_users + psc_license_keys.user_id, and routes are /v1/ versioned, so
 /v2/ can add them without a rewrite.
 """
 import base64
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -73,14 +92,22 @@ from collections import defaultdict
 
 from flask import Flask, jsonify, request
 
+import mailer
 from store import canon_email, get_store
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 KEY_ALPHABET = string.ascii_uppercase + string.digits
 TRIAL_DAYS = 3
 TRIAL_SECONDS = TRIAL_DAYS * 86400
 SESSION_DAYS = 30
 SESSION_SECONDS = SESSION_DAYS * 86400
+# Email verification codes (v3.3.0)
+CODE_TTL_SECONDS = 600
+CODE_COOLDOWN_SECONDS = 60
+CODE_HOURLY_MAX = 5
+CODE_MAX_ATTEMPTS = 5
+PASSWORD_MIN_LENGTH = 6
+PASSWORD_ITERATIONS = 200000
 
 app = Flask(__name__)
 store = get_store()
@@ -224,6 +251,92 @@ def _new_session(user_id, email):
                           "exp": now + SESSION_SECONDS})
 
 
+# ------------------------------------------------------- passwords + OTP --
+def _hash_password(password):
+    salt = secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                             salt, PASSWORD_ITERATIONS)
+    return "pbkdf2$%d$%s$%s" % (PASSWORD_ITERATIONS, _b64url(salt), _b64url(dk))
+
+
+def _check_password(password, stored):
+    try:
+        scheme, iters, salt_b64, hash_b64 = str(stored or "").split("$")
+        if scheme != "pbkdf2":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                 _b64url_decode(salt_b64), int(iters))
+        return hmac.compare_digest(dk, _b64url_decode(hash_b64))
+    except Exception:
+        return False
+
+
+def _issue_code(email, purpose, payload=None):
+    """Rate-limited code issue: cooldown + hourly cap, store only the hash,
+    email the code. Returns a Flask response. For a signup RESEND (payload
+    None) the pending signup details from the first call are preserved."""
+    from datetime import datetime, timedelta, timezone
+    now = int(time.time())
+    existing = store.get_verification(email, purpose)
+    if existing:
+        # created_at is not arithmetic-friendly; creation = expiry - TTL.
+        created_ts = int(existing["expires_at"]) - CODE_TTL_SECONDS
+        wait = CODE_COOLDOWN_SECONDS - (now - created_ts)
+        if wait > 0:
+            return jsonify({"error": "too_many_codes",
+                            "message": "একটু অপেক্ষা করুন — %d সেকেন্ড পরে আবার কোড পাঠাতে পারবেন।" % wait,
+                            "retry_after": wait}), 429
+        if payload is None and existing.get("payload"):
+            payload = existing["payload"]
+    if purpose == "signup" and not payload:
+        return jsonify({"error": "signup_first",
+                        "message": "আগে সাইন আপের তথ্য (নাম, মোবাইল, পাসওয়ার্ড) দিন।"}), 400
+    since = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    if store.count_recent_codes(email, since) >= CODE_HOURLY_MAX:
+        return jsonify({"error": "too_many_codes",
+                        "message": "এক ঘণ্টায় অনেকগুলো কোড পাঠানো হয়েছে — পরে আবার চেষ্টা করুন।",
+                        "retry_after": 3600}), 429
+    code = "%06d" % secrets.randbelow(1000000)
+    code_hash = hashlib.sha256(code.encode("ascii")).hexdigest()
+    ver_id = "V-" + "".join(secrets.choice(KEY_ALPHABET) for _ in range(8))
+    store.delete_verifications(email, purpose)
+    store.create_verification(ver_id, email, purpose, code_hash, payload,
+                              now + CODE_TTL_SECONDS)
+    ok, reason = mailer.send_code_email(email, code, purpose)
+    if not ok:
+        store.delete_verifications(email, purpose)
+        if reason == "not_configured":
+            return jsonify({"error": "email_unconfigured",
+                            "message": "ইমেইল পাঠানোর সেটআপ হয়নি — আতিকুরের সাথে যোগাযোগ করুন।"}), 503
+        return jsonify({"error": "email_send_failed",
+                        "message": "কোড পাঠানো যায়নি — আবার চেষ্টা করুন।"}), 502
+    return jsonify({"otp_required": True, "email": email, "sent": True})
+
+
+def _check_code(email, purpose, code):
+    """Returns (row, None) when the code matches, else (None, response)."""
+    row = store.get_verification(email, purpose)
+    if not row:
+        return None, (jsonify({"error": "invalid_code",
+                               "message": "কোডটি ভুল বা মেয়াদ শেষ — নতুন কোড পাঠান।"}), 400)
+    if int(time.time()) > int(row["expires_at"]):
+        store.delete_verifications(email, purpose)
+        return None, (jsonify({"error": "code_expired",
+                               "message": "কোডের মেয়াদ শেষ — নতুন কোড পাঠান।"}), 400)
+    if int(row.get("attempts") or 0) >= CODE_MAX_ATTEMPTS:
+        store.delete_verifications(email, purpose)
+        return None, (jsonify({"error": "invalid_code",
+                               "message": "অনেকবার ভুল কোড দেওয়া হয়েছে — নতুন কোড পাঠান।"}), 400)
+    digest = hashlib.sha256(str(code or "").strip().encode("ascii", "ignore")).hexdigest()
+    if not hmac.compare_digest(digest, row["code_hash"]):
+        attempts = store.bump_attempts(row["id"])
+        if attempts >= CODE_MAX_ATTEMPTS:
+            store.delete_verifications(email, purpose)
+        return None, (jsonify({"error": "invalid_code",
+                               "message": "কোডটি ভুল — আবার চেষ্টা করুন।"}), 400)
+    return row, None
+
+
 # Light brute-force guard on activation: 30 attempts per IP per 10 minutes.
 _ATTEMPTS = defaultdict(list)
 
@@ -309,8 +422,8 @@ def activate():
 
 @app.route("/v1/signup", methods=["POST"])
 def signup():
-    """Create a shopkeeper account: full name + phone + post office + Gmail.
-    One account per Gmail. Returns the account + a 30-day session token."""
+    """Step 1 of signup: validate the fields + password and email a
+    verification code. The account is created only by verify-signup."""
     if _rate_limited():
         return jsonify({"error": "too_many_attempts",
                         "message": "অনেকবার চেষ্টা করা হয়েছে — কিছুক্ষণ পরে আবার চেষ্টা করুন।"}), 429
@@ -319,39 +432,76 @@ def signup():
     phone = _norm_phone(body.get("phone"))
     post_office = (body.get("post_office") or "").strip()
     email = _norm_email(body.get("email"))
-    if not full_name or not phone or not post_office or not email:
+    password = str(body.get("password") or "")
+    if not full_name or not phone or not post_office or not email or not password:
         return jsonify({"error": "missing_fields",
-                        "message": "নাম, মোবাইল নম্বর, পোস্ট অফিস ও Gmail — সবগুলো লাগবে।"}), 400
+                        "message": "নাম, মোবাইল নম্বর, পোস্ট অফিস, Gmail ও পাসওয়ার্ড — সবগুলো লাগবে।"}), 400
     if "@" not in email or "." not in email.split("@")[-1]:
         return jsonify({"error": "invalid_email",
                         "message": "সঠিক Gmail ঠিকানা দিন।"}), 400
+    if len(password) < PASSWORD_MIN_LENGTH:
+        return jsonify({"error": "weak_password",
+                        "message": "পাসওয়ার্ড কমপক্ষে %d অক্ষরের হতে হবে।" % PASSWORD_MIN_LENGTH}), 400
     if store.get_user_by_email(email):
         return jsonify({"error": "account_exists",
                         "message": "এই Gmail দিয়ে অ্যাকাউন্ট আছে — লগইন করুন।"}), 409
-    user_id = _new_user_id()
-    if not store.create_user(user_id, full_name, phone, post_office, email):
-        # Unique-email race: another signup for this mailbox just landed.
+    payload = json.dumps({"full_name": full_name, "phone": phone,
+                          "post_office": post_office,
+                          "password_hash": _hash_password(password)})
+    return _issue_code(email, "signup", payload)
+
+
+@app.route("/v1/verify-signup", methods=["POST"])
+def verify_signup():
+    """Step 2 of signup: a correct code creates the account + session."""
+    if _rate_limited():
+        return jsonify({"error": "too_many_attempts",
+                        "message": "অনেকবার চেষ্টা করা হয়েছে — কিছুক্ষণ পরে আবার চেষ্টা করুন।"}), 429
+    body = request.get_json(silent=True) or {}
+    email = _norm_email(body.get("email"))
+    code = str(body.get("code") or "").strip()
+    if not email or not code:
+        return jsonify({"error": "missing_fields",
+                        "message": "Gmail ও কোড — দুটোই লাগবে।"}), 400
+    row, err = _check_code(email, "signup", code)
+    if err:
+        return err
+    try:
+        payload = json.loads(row.get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    if store.get_user_by_email(email):
+        store.delete_verifications(email, "signup")
         return jsonify({"error": "account_exists",
                         "message": "এই Gmail দিয়ে অ্যাকাউন্ট আছে — লগইন করুন।"}), 409
-    return jsonify({"user_id": user_id, "full_name": full_name,
-                    "phone": phone, "post_office": post_office,
+    user_id = _new_user_id()
+    if not store.create_user(user_id, payload.get("full_name", ""),
+                             payload.get("phone", ""), payload.get("post_office", ""),
+                             email, payload.get("password_hash")):
+        return jsonify({"error": "account_exists",
+                        "message": "এই Gmail দিয়ে অ্যাকাউন্ট আছে — লগইন করুন।"}), 409
+    store.delete_verifications(email, "signup")
+    return jsonify({"user_id": user_id, "full_name": payload.get("full_name", ""),
+                    "phone": payload.get("phone", ""),
+                    "post_office": payload.get("post_office", ""),
                     "email": email,
                     "session_token": _new_session(user_id, email)}), 201
 
 
 @app.route("/v1/login", methods=["POST"])
 def login():
-    """Log in with Gmail + phone (the two the shopkeeper gave at signup).
-    Returns the account + a fresh 30-day session token."""
+    """Step 1 of login: check the password (or the phone for legacy
+    accounts without a password), then email a verification code."""
     if _rate_limited():
         return jsonify({"error": "too_many_attempts",
                         "message": "অনেকবার চেষ্টা করা হয়েছে — কিছুক্ষণ পরে আবার চেষ্টা করুন।"}), 429
     body = request.get_json(silent=True) or {}
     email = _norm_email(body.get("email"))
+    password = str(body.get("password") or "")
     phone = _norm_phone(body.get("phone"))
-    if not email or not phone:
+    if not email:
         return jsonify({"error": "missing_fields",
-                        "message": "Gmail ও মোবাইল নম্বর — দুটোই লাগবে।"}), 400
+                        "message": "Gmail লাগবে।"}), 400
     user = store.get_user_by_email(email)
     if not user:
         return jsonify({"error": "account_not_found",
@@ -359,14 +509,104 @@ def login():
     if user.get("banned"):
         return jsonify({"error": "account_banned",
                         "message": "এই অ্যাকাউন্টটি বন্ধ করা হয়েছে — আতিকুরের সাথে যোগাযোগ করুন।"}), 403
-    if _norm_phone(user.get("phone")) != phone:
-        return jsonify({"error": "wrong_phone",
-                        "message": "মোবাইল নম্বর মেলেনি — সাইন আপের সময় দেওয়া নম্বরটি দিন।"}), 403
+    if user.get("password_hash"):
+        if not password or not _check_password(password, user["password_hash"]):
+            return jsonify({"error": "wrong_password",
+                            "message": "পাসওয়ার্ড ভুল হয়েছে।"}), 403
+    else:
+        # Legacy account (created before passwords): phone identifies it.
+        if not phone or _norm_phone(user.get("phone")) != phone:
+            return jsonify({"error": "wrong_phone",
+                            "message": "মোবাইল নম্বর মেলেনি — সাইন আপের সময় দেওয়া নম্বরটি দিন।"}), 403
+    return _issue_code(email, "login")
+
+
+@app.route("/v1/verify-login", methods=["POST"])
+def verify_login():
+    """Step 2 of login: a correct code returns a fresh session token."""
+    if _rate_limited():
+        return jsonify({"error": "too_many_attempts",
+                        "message": "অনেকবার চেষ্টা করা হয়েছে — কিছুক্ষণ পরে আবার চেষ্টা করুন।"}), 429
+    body = request.get_json(silent=True) or {}
+    email = _norm_email(body.get("email"))
+    code = str(body.get("code") or "").strip()
+    if not email or not code:
+        return jsonify({"error": "missing_fields",
+                        "message": "Gmail ও কোড — দুটোই লাগবে।"}), 400
+    _row, err = _check_code(email, "login", code)
+    if err:
+        return err
+    user = store.get_user_by_email(email)
+    if not user:
+        return jsonify({"error": "account_not_found",
+                        "message": "এই Gmail দিয়ে অ্যাকাউন্ট পাওয়া যায়নি — সাইন আপ করুন।"}), 404
+    if user.get("banned"):
+        return jsonify({"error": "account_banned",
+                        "message": "এই অ্যাকাউন্টটি বন্ধ করা হয়েছে — আতিকুরের সাথে যোগাযোগ করুন।"}), 403
+    store.delete_verifications(email, "login")
     return jsonify({"user_id": user["id"], "full_name": user.get("full_name"),
                     "phone": user.get("phone"),
                     "post_office": user.get("post_office"),
                     "email": email,
                     "session_token": _new_session(user["id"], email)})
+
+
+@app.route("/v1/request-code", methods=["POST"])
+def request_code():
+    """(Re)send a verification code. purpose: signup | login | reset."""
+    if _rate_limited():
+        return jsonify({"error": "too_many_attempts",
+                        "message": "অনেকবার চেষ্টা করা হয়েছে — কিছুক্ষণ পরে আবার চেষ্টা করুন।"}), 429
+    body = request.get_json(silent=True) or {}
+    email = _norm_email(body.get("email"))
+    purpose = str(body.get("purpose") or "").strip()
+    if not email or purpose not in ("signup", "login", "reset"):
+        return jsonify({"error": "missing_fields",
+                        "message": "Gmail ও সঠিক ধরন লাগবে।"}), 400
+    user = store.get_user_by_email(email)
+    if purpose == "signup":
+        if user:
+            return jsonify({"error": "account_exists",
+                            "message": "এই Gmail দিয়ে অ্যাকাউন্ট আছে — লগইন করুন।"}), 409
+    else:
+        if not user:
+            return jsonify({"error": "account_not_found",
+                            "message": "এই Gmail দিয়ে অ্যাকাউন্ট পাওয়া যায়নি — সাইন আপ করুন।"}), 404
+        if user.get("banned"):
+            return jsonify({"error": "account_banned",
+                            "message": "এই অ্যাকাউন্টটি বন্ধ করা হয়েছে — আতিকুরের সাথে যোগাযোগ করুন।"}), 403
+    return _issue_code(email, purpose)
+
+
+@app.route("/v1/reset-password", methods=["POST"])
+def reset_password():
+    """Set a new password after an emailed code (forgot/change flow)."""
+    if _rate_limited():
+        return jsonify({"error": "too_many_attempts",
+                        "message": "অনেকবার চেষ্টা করা হয়েছে — কিছুক্ষণ পরে আবার চেষ্টা করুন।"}), 429
+    body = request.get_json(silent=True) or {}
+    email = _norm_email(body.get("email"))
+    code = str(body.get("code") or "").strip()
+    new_password = str(body.get("new_password") or "")
+    if not email or not code or not new_password:
+        return jsonify({"error": "missing_fields",
+                        "message": "Gmail, কোড ও নতুন পাসওয়ার্ড — সবগুলো লাগবে।"}), 400
+    if len(new_password) < PASSWORD_MIN_LENGTH:
+        return jsonify({"error": "weak_password",
+                        "message": "পাসওয়ার্ড কমপক্ষে %d অক্ষরের হতে হবে।" % PASSWORD_MIN_LENGTH}), 400
+    user = store.get_user_by_email(email)
+    if not user:
+        return jsonify({"error": "account_not_found",
+                        "message": "এই Gmail দিয়ে অ্যাকাউন্ট পাওয়া যায়নি — সাইন আপ করুন।"}), 404
+    if user.get("banned"):
+        return jsonify({"error": "account_banned",
+                        "message": "এই অ্যাকাউন্টটি বন্ধ করা হয়েছে — আতিকুরের সাথে যোগাযোগ করুন।"}), 403
+    _row, err = _check_code(email, "reset", code)
+    if err:
+        return err
+    store.set_password_hash(user["id"], _hash_password(new_password))
+    store.delete_verifications(email, "reset")
+    return jsonify({"ok": True, "email": email})
 
 
 @app.route("/v1/start-trial", methods=["POST"])

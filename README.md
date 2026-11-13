@@ -13,9 +13,22 @@ locally with the embedded public key.
 | GET | `/health` | — | `{"status":"ok"}` |
 | POST | `/v1/register-key` | `X-Admin-Secret` | Body `{"install_id"?}` → creates a key, returns `{"key_id","key","install_id"}`. Used by keygen.html. |
 | POST | `/v1/activate` | — | Body `{"install_id","key"}` → validates, binds key to install_id on first use, rejects if bound elsewhere. Returns `{"token","install_id","key_id"}`. |
+| POST | `/v1/signup` | — | Body `{"full_name","phone","post_office","email","password"}` → emails a 6-digit code; account created by verify-signup. One account per Gmail (canonical mailbox form). |
+| POST | `/v1/verify-signup` | — | Body `{"email","code"}` → creates the account, returns a 30-day session token. |
+| POST | `/v1/login` | — | Body `{"email","password?","phone?"}` → password accounts need the password, legacy accounts need the phone; then emails a code. |
+| POST | `/v1/verify-login` | — | Body `{"email","code"}` → returns a fresh 30-day session token. |
+| POST | `/v1/request-code` | — | Body `{"email","purpose":"signup"\|"login"\|"reset"}` → (re)sends a code. 60s cooldown, 5/hour per mailbox. |
+| POST | `/v1/reset-password` | — | Body `{"email","code","new_password"}` → sets a new password. |
+| POST | `/v1/start-trial` | `Bearer` session | Body `{"install_id"}` → 3-day trial token, one per account. |
 | GET | `/v1/keys` | `X-Admin-Secret` | Lists issued keys + bindings. |
-| GET | `/v1/export` | `X-Admin-Secret` | Full backup dump (keys). |
+| GET | `/v1/users` | `X-Admin-Secret` | Lists shopkeeper accounts (Gmail, name, phone, trial state, banned). |
+| POST | `/v1/users/<id>/ban` | `X-Admin-Secret` | Body `{"banned":true/false}`. |
+| GET | `/v1/export` | `X-Admin-Secret` | Full backup dump (keys, users, trials; password hashes stripped). |
 | GET | `/v1/public-key` | — | The RSA public key (same as `public_key.pem` in this repo). |
+
+Passwords are stored as PBKDF2-HMAC-SHA256 hashes (200k iterations), never
+plaintext. Verification codes live only as SHA-256 hashes, expire after 10
+minutes, and allow 5 attempts. Code emails go out via SMTP — see `mailer.py`.
 
 Key format: `XXXXX-XXXXX-XXXXX-XXXXX` (uppercase letters + digits, no confusing
 characters). One key = one device (install_id). A key bound to a different
@@ -44,6 +57,10 @@ backup route.
 2. In the Render dashboard set the env vars (never commit them):
    - `LICENSE_SIGNING_KEY` — RSA-2048 private key PEM (whole file)
    - `LICENSE_ADMIN_SECRET` — admin secret used by keygen.html
+   - `SMTP_USER` + `SMTP_APP_PASSWORD` — Gmail address + app password that
+     sends the verification codes (optional `SMTP_HOST`/`SMTP_PORT`/
+     `SMTP_FROM`; defaults are Gmail's). Without them the auth endpoints
+     report `email_unconfigured`.
 3. Note the service URL (`https://pesticide-license-server.onrender.com`).
    Optional custom domain: `license.atikur.cyou` — Cloudflare CNAME to the
    Render service, then verify in Render. The app uses ONE base URL; if the
@@ -60,12 +77,10 @@ LICENSE_ADMIN_SECRET="..." python app.py
 # server on http://127.0.0.1:5000
 ```
 
-## Future: shopkeeper accounts + cloud sync (NOT in V3)
+## Shopkeeper accounts (live since v3.1, passwords + email codes since v3.3)
 
-The storage layer is already designed for it: `psc_license_keys.user_id`
-(nullable) and a `psc_users` table with the signup fields — full_name, phone,
-post_office (address), email (Gmail). The next phase will add per-account
-data tables (bills, stock, ledger rows keyed by `user_id`) so a shopkeeper
-who logs back in after a device crash restores everything, plus `/v2/`
-account + sync endpoints. Nothing about accounts or sync is implemented
-here.
+Accounts live in `psc_users` (full_name, phone, post_office, email, password
+hash, banned flag). Trials are one per account (`psc_trials`, keyed by
+user_id). Cloud sync of shop data (bills/stock/ledger keyed by `user_id`)
+is still a future phase — data stays on the device, with file + Google
+Drive backup in the app.
