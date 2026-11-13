@@ -32,6 +32,13 @@ Endpoints (all JSON):
                                    app creates a new install_id and therefore
                                    a new trial — known limit, see store.py.
   GET  /v1/keys                 -> admin only. Lists issued keys + bindings.
+  GET  /v1/users                -> admin only. Lists shopkeeper accounts
+                                   (Gmail, name, phone, trial state, banned).
+  POST /v1/users/<id>/ban       -> admin only. {banned: true/false}.
+                                   A banned account cannot log in or start
+                                   a trial (already-issued 30-day sessions
+                                   keep working offline until they expire —
+                                   the app verifies them without a network).
   GET  /v1/export               -> admin only. Full JSON backup dump.
 
 Token: base64url(payload) + "." + base64url(RSA-PKCS1v1.5-SHA256 signature)
@@ -66,9 +73,9 @@ from collections import defaultdict
 
 from flask import Flask, jsonify, request
 
-from store import get_store
+from store import canon_email, get_store
 
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 KEY_ALPHABET = string.ascii_uppercase + string.digits
 TRIAL_DAYS = 3
 TRIAL_SECONDS = TRIAL_DAYS * 86400
@@ -185,7 +192,8 @@ def _new_user_id() -> str:
 
 
 def _norm_email(raw) -> str:
-    return str(raw or "").strip().lower()
+    # Canonical mailbox form (Gmail dots / +tags collapse to one mailbox).
+    return canon_email(raw)
 
 
 def _norm_phone(raw) -> str:
@@ -321,7 +329,10 @@ def signup():
         return jsonify({"error": "account_exists",
                         "message": "এই Gmail দিয়ে অ্যাকাউন্ট আছে — লগইন করুন।"}), 409
     user_id = _new_user_id()
-    store.create_user(user_id, full_name, phone, post_office, email)
+    if not store.create_user(user_id, full_name, phone, post_office, email):
+        # Unique-email race: another signup for this mailbox just landed.
+        return jsonify({"error": "account_exists",
+                        "message": "এই Gmail দিয়ে অ্যাকাউন্ট আছে — লগইন করুন।"}), 409
     return jsonify({"user_id": user_id, "full_name": full_name,
                     "phone": phone, "post_office": post_office,
                     "email": email,
@@ -345,6 +356,9 @@ def login():
     if not user:
         return jsonify({"error": "account_not_found",
                         "message": "এই Gmail দিয়ে অ্যাকাউন্ট পাওয়া যায়নি — সাইন আপ করুন।"}), 404
+    if user.get("banned"):
+        return jsonify({"error": "account_banned",
+                        "message": "এই অ্যাকাউন্টটি বন্ধ করা হয়েছে — আতিকুরের সাথে যোগাযোগ করুন।"}), 403
     if _norm_phone(user.get("phone")) != phone:
         return jsonify({"error": "wrong_phone",
                         "message": "মোবাইল নম্বর মেলেনি — সাইন আপের সময় দেওয়া নম্বরটি দিন।"}), 403
@@ -365,6 +379,10 @@ def start_trial():
         return jsonify({"error": "unauthorized",
                         "message": "প্রথমে লগইন করুন — ট্রায়াল শুরু করতে অ্যাকাউন্ট লাগবে।"}), 401
     user_id = sess["user_id"]
+    user = store.get_user_by_id(user_id)
+    if user and user.get("banned"):
+        return jsonify({"error": "account_banned",
+                        "message": "এই অ্যাকাউন্টটি বন্ধ করা হয়েছে — আতিকুরের সাথে যোগাযোগ করুন।"}), 403
     body = request.get_json(silent=True) or {}
     install_id = (body.get("install_id") or "").strip().upper()
     if not install_id:
@@ -396,6 +414,45 @@ def list_keys():
     if not _admin_ok():
         return jsonify({"error": "unauthorized"}), 401
     return jsonify({"keys": store.list_keys()})
+
+
+@app.route("/v1/users", methods=["GET"])
+def list_users():
+    if not _admin_ok():
+        return jsonify({"error": "unauthorized"}), 401
+    now = int(time.time())
+    trials = {t["user_id"]: t for t in store.list_trials()}
+    users = []
+    for u in store.list_users():
+        trial = trials.get(u["id"])
+        days_left = None
+        if trial:
+            days_left = min(TRIAL_DAYS,
+                            max(0, (int(trial["expires_at"]) - now + 86399) // 86400))
+        users.append({"user_id": u["id"],
+                      "full_name": u.get("full_name"),
+                      "phone": u.get("phone"),
+                      "post_office": u.get("post_office"),
+                      "email": u.get("email"),
+                      "banned": bool(u.get("banned")),
+                      "created_at": u.get("created_at"),
+                      "trial_expires_at": int(trial["expires_at"]) if trial else None,
+                      "trial_days_left": days_left})
+    return jsonify({"count": len(users), "users": users})
+
+
+@app.route("/v1/users/<user_id>/ban", methods=["POST"])
+def ban_user(user_id):
+    if not _admin_ok():
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(silent=True) or {}
+    banned = body.get("banned", True)
+    user = store.get_user_by_id(user_id)
+    if not user:
+        return jsonify({"error": "user_not_found"}), 404
+    store.set_banned(user_id, bool(banned))
+    return jsonify({"user_id": user_id, "email": user.get("email"),
+                    "banned": bool(banned)})
 
 
 @app.route("/v1/export", methods=["GET"])

@@ -33,6 +33,52 @@ def _norm_key(raw):
     register-key stored."""
     return re.sub(r"[^A-Z0-9]", "", str(raw or "").upper())
 
+
+def canon_email(raw):
+    """Canonical mailbox form: lowercase + trimmed. For Gmail addresses
+    (gmail.com / googlemail.com) dots in the local part are ignored and
+    anything after '+' is ignored — a.tikur+shop@gmail.com IS
+    atikur@gmail.com. Without this, one Gmail can open many accounts
+    (dots / +tags), which is exactly what happened live (Nov 2026)."""
+    email = str(raw or "").strip().lower()
+    if "@" not in email:
+        return email
+    local, domain = email.rsplit("@", 1)
+    if domain in ("gmail.com", "googlemail.com"):
+        local = local.split("+", 1)[0].replace(".", "")
+        domain = "gmail.com"
+    return local + "@" + domain
+
+
+def _dedupe_emails(rows):
+    """rows: [(id, email)] ordered oldest-first. Returns {id: new_email}
+    for rows whose stored email must change: the earliest account per
+    mailbox gets the canonical address; later duplicates get a +dup<N>
+    variant (never log-in-able — login canonicalizes first — but always
+    visible in the admin list, and bannable). Nothing is deleted."""
+    used = set()
+    claimed = set()
+    updates = {}
+    for _id, raw in rows:
+        canon = canon_email(raw)
+        if canon not in claimed:
+            claimed.add(canon)
+            used.add(canon)
+            if raw != canon:
+                updates[_id] = canon
+        else:
+            local, sep, domain = canon.partition("@")
+            n = 1
+            while True:
+                cand = "%s+dup%d%s%s" % (local, n, "@" if sep else "", domain)
+                if cand not in used:
+                    break
+                n += 1
+            used.add(cand)
+            if raw != cand:
+                updates[_id] = cand
+    return updates
+
 SCHEMA_KEYS = """
 CREATE TABLE IF NOT EXISTS psc_license_keys (
     key_id      TEXT PRIMARY KEY,
@@ -52,6 +98,7 @@ CREATE TABLE IF NOT EXISTS psc_users (
     phone       TEXT,
     post_office TEXT,
     email       TEXT,
+    banned      INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL
 );
 """
@@ -105,6 +152,24 @@ class SQLiteStore:
                     ALTER TABLE psc_trials_new RENAME TO psc_trials;
                 """)
                 self._conn.commit()
+            # Migrate psc_users: banned column + canonical emails + unique index.
+            cols = [r[1] for r in self._conn.execute(
+                "PRAGMA table_info('psc_users')").fetchall()]
+            if 'banned' not in cols:
+                self._conn.execute(
+                    "ALTER TABLE psc_users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
+            rows = self._conn.execute(
+                "SELECT id, email FROM psc_users ORDER BY created_at ASC, id ASC").fetchall()
+            for _id, new_email in _dedupe_emails([(r[0], r[1]) for r in rows]).items():
+                self._conn.execute(
+                    "UPDATE psc_users SET email = ? WHERE id = ?", (new_email, _id))
+            self._conn.commit()
+            try:
+                self._conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_psc_users_email ON psc_users(email)")
+                self._conn.commit()
+            except Exception as e:
+                print("WARNING: could not create unique email index: %s" % e, flush=True)
         self.backend = "sqlite"
 
     def get_key_by_install_id(self, install_id):
@@ -136,19 +201,39 @@ class SQLiteStore:
         return [dict(r) for r in rows]
 
     def create_user(self, user_id, full_name, phone, post_office, email):
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO psc_users (id, full_name, phone, post_office, email, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (user_id, full_name, phone, post_office, email, _now_iso()))
-            self._conn.commit()
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO psc_users (id, full_name, phone, post_office, email, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_id, full_name, phone, post_office, email, _now_iso()))
+                self._conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # Unique-email race: another signup for this mailbox just landed.
+            return False
 
     def get_user_by_email(self, email):
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM psc_users WHERE email = ?",
+                "SELECT * FROM psc_users WHERE email = ?"
+                " ORDER BY created_at ASC, id ASC LIMIT 1",
                 (email,)).fetchone()
         return dict(row) if row else None
+
+    def list_users(self):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM psc_users ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def set_banned(self, user_id, banned):
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE psc_users SET banned = ? WHERE id = ?",
+                (1 if banned else 0, user_id))
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def get_user_by_id(self, user_id):
         with self._lock:
@@ -229,6 +314,29 @@ class PostgresStore:
                             _sql.Identifier(pkrow[0])))
                         cur.execute("ALTER TABLE psc_trials ADD PRIMARY KEY (user_id)")
             conn.commit()
+            # Migrate psc_users: banned column + canonical emails.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "ALTER TABLE psc_users ADD COLUMN IF NOT EXISTS banned INTEGER NOT NULL DEFAULT 0")
+                cur.execute(
+                    "SELECT id, email FROM psc_users ORDER BY created_at ASC, id ASC")
+                rows = cur.fetchall()
+                for _id, new_email in _dedupe_emails(
+                        [(r[0], r[1]) for r in rows]).items():
+                    cur.execute(
+                        "UPDATE psc_users SET email = %s WHERE id = %s",
+                        (new_email, _id))
+            conn.commit()
+            # Unique email index in its own transaction: a failure here must
+            # never take the server down (the app-level check still applies).
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_psc_users_email ON psc_users(email)")
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                print("WARNING: could not create unique email index: %s" % e, flush=True)
         finally:
             conn.close()
         self.backend = "postgres"
@@ -285,6 +393,11 @@ class PostgresStore:
                     " VALUES (%s, %s, %s, %s, %s, %s)",
                     (user_id, full_name, phone, post_office, email, _now_iso()))
             conn.commit()
+            return True
+        except self._psycopg2.IntegrityError:
+            # Unique-email race: another signup for this mailbox just landed.
+            conn.rollback()
+            return False
         finally:
             conn.close()
 
@@ -292,10 +405,33 @@ class PostgresStore:
         conn = self._connect()
         try:
             with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
-                cur.execute("SELECT * FROM psc_users WHERE email = %s",
+                cur.execute("SELECT * FROM psc_users WHERE email = %s"
+                            " ORDER BY created_at ASC, id ASC LIMIT 1",
                             (email,))
                 row = cur.fetchone()
             return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def list_users(self):
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM psc_users ORDER BY created_at DESC")
+                return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def set_banned(self, user_id, banned):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE psc_users SET banned = %s WHERE id = %s",
+                    (1 if banned else 0, user_id))
+                changed = cur.rowcount > 0
+            conn.commit()
+            return changed
         finally:
             conn.close()
 
