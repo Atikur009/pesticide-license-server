@@ -13,8 +13,9 @@ locally with the embedded public key.
 | GET | `/health` | — | `{"status":"ok"}` |
 | POST | `/v1/register-key` | `X-Admin-Secret` | Body `{"install_id"?, "plan"?}` → creates a key, returns `{"key_id","key","plan","install_id"}`. `plan`: `monthly` (30 days) \| `yearly` (365 days) \| `lifetime` (default, no expiry). Used by keygen.html. |
 | POST | `/v1/activate` | — | Body `{"install_id","key"}` → validates, binds key to install_id on first use, rejects if bound elsewhere. Returns `{"token","install_id","key_id","plan","expires_at","days_left"}`. Renewal keys stack onto the device's latest expiry; re-entering the same key returns its stored expiry; a lifetime device rejects new keys (409). |
-| POST | `/v1/purchase` | — | Body `{"install_id","plan"}` → creates an Atikur Pay checkout for the plan's BDT price, returns `{"payment_id","payment_url","amount","currency":"BDT","plan","status":"pending"}`. Needs `ATIKUR_PAY_API_KEY` (else 503); a lifetime device gets 409. |
-| POST | `/v1/purchase/status` | — | Body `{"payment_id"}` → asks the gateway: pending → `{"status":"pending"}`; paid → the key is issued server-side and the exact `/v1/activate` response is returned (repeat calls return the same stored activation, never a second key); failed → `{"status":"failed"}`. |
+| POST | `/v1/purchase` | — | Body `{"install_id","plan"}` → creates a PENDING purchase row keyed by a `purchase_ref` generated here, returns `{"purchase_ref","payment_url","amount","currency":"BDT","plan","status":"pending"}`. `payment_url` is the gateway's public `/buy/pesticide` page — this server never calls the gateway. Needs `PAYMENT_WEBHOOK_SECRET` (else 503); a lifetime device gets 409. |
+| POST | `/v1/purchase/status` | — | Body `{"purchase_ref"}` → local row only: pending → `{"status":"pending"}`; paid → the stored activation (the exact `/v1/activate` response, issued by the callback; repeat calls return the same stored activation, never a second key); failed → `{"status":"failed"}`. |
+| POST | `/v1/payment-callback` | `X-Webhook-Secret` | Gateway webhook: body `{"payment_id","purchase_ref","install_id","plan","amount","trx_id"}`. Row install_id/plan/amount must match the webhook (mismatch → 400, nothing issued). Paid → key issued server-side, `{"status":"paid","key_id"}`; repeat callbacks → `{"status":"already_paid"}`. |
 | POST | `/v1/signup` | — | Body `{"full_name","phone","post_office","email","password"}` → emails a 6-digit code; account created by verify-signup. One account per Gmail (canonical mailbox form). |
 | POST | `/v1/verify-signup` | — | Body `{"email","code"}` → creates the account, returns a 30-day session token. |
 | POST | `/v1/login` | — | Body `{"email","password?","phone?"}` → password accounts need the password, legacy accounts need the phone; then emails a code. |
@@ -63,12 +64,15 @@ backup route.
      sends the verification codes (optional `SMTP_HOST`/`SMTP_PORT`/
      `SMTP_FROM`; defaults are Gmail's). Without them the auth endpoints
      report `email_unconfigured`.
-   - `ATIKUR_PAY_API_KEY` — merchant API key from the Atikur Pay gateway
-     dashboard (for the pesticide app's merchant account). Without it the
-     auto-buy endpoints report `gateway_not_configured`. Optional:
-     `ATIKUR_PAY_BASE_URL` (default `https://atikur-pay.onrender.com`) and
-     `PLAN_PRICES_BDT` (JSON override of the ৳250 / ৳2,500 / ৳12,500
-     monthly / yearly / lifetime prices).
+   - `PAYMENT_WEBHOOK_SECRET` — shared secret the Atikur Pay gateway
+     sends as `X-Webhook-Secret` on `/v1/payment-callback`. MUST match
+     the same env var on the gateway. Without it `/v1/purchase` reports
+     `gateway_not_configured`. Optional: `GATEWAY_BUY_URL` (default
+     `https://atikur-pay.onrender.com`, used only to build the buy link)
+     and `PLAN_PRICES_BDT` (JSON override of the ৳250 / ৳2,500 / ৳12,500
+     monthly / yearly / lifetime prices — the gateway has its own copy
+     of this table and the two MUST match; the callback rejects any
+     payment whose amount differs).
 3. Note the service URL (`https://pesticide-license-server.onrender.com`).
    Optional custom domain: `license.atikur.cyou` — Cloudflare CNAME to the
    Render service, then verify in Render. The app uses ONE base URL; if the

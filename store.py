@@ -152,15 +152,20 @@ CREATE TABLE IF NOT EXISTS psc_trials (
 
 
 # Auto-payment purchases (Atikur Pay gateway): one row per checkout the
-# app starts. `status` is pending until the gateway reports the payment
-# paid; the license key is then issued server-side and the row records
-# its key_id, so a repeated status check can NEVER issue a second key.
-# `issuing` is a transient claim state: the status check flips a pending
-# row to `issuing` (one atomic UPDATE) before creating the key, so two
-# concurrent checks cannot both issue. `failed` is terminal.
+# app starts. The row is keyed by `purchase_ref`, generated HERE (the
+# license server never calls the gateway — PythonAnywhere free cannot
+# reach it). The gateway's public checkout endpoint creates the payment
+# and, when it is paid, webhooks /v1/payment-callback with the ref; the
+# license key is then issued server-side and the row records its key_id
+# + the gateway's payment id, so a repeated callback or status check
+# can NEVER issue a second key. `issuing` is a transient claim state:
+# the callback flips a pending row to `issuing` (one atomic UPDATE)
+# before creating the key, so two concurrent callbacks cannot both
+# issue. `failed` is terminal.
 SCHEMA_PAYMENTS = """
 CREATE TABLE IF NOT EXISTS psc_payments (
-    payment_id TEXT PRIMARY KEY,
+    purchase_ref TEXT PRIMARY KEY,
+    gateway_payment_id TEXT,
     install_id TEXT NOT NULL,
     plan       TEXT NOT NULL,
     amount     INTEGER NOT NULL,
@@ -213,6 +218,20 @@ class SQLiteStore:
             if 'expires_at' not in key_cols:
                 self._conn.execute(
                     "ALTER TABLE psc_license_keys ADD COLUMN expires_at INTEGER")
+            self._conn.commit()
+            # Migrate psc_payments (webhook redesign): rows are keyed by
+            # purchase_ref (generated here) + the gateway's payment id
+            # arrives later via the callback. Fresh DBs get both columns
+            # from CREATE TABLE; this covers a DB created by the
+            # never-deployed direct-call build (payment_id PK schema).
+            pay_cols = [r[1] for r in self._conn.execute(
+                "PRAGMA table_info('psc_payments')").fetchall()]
+            if 'purchase_ref' not in pay_cols:
+                self._conn.execute(
+                    "ALTER TABLE psc_payments ADD COLUMN purchase_ref TEXT")
+            if 'gateway_payment_id' not in pay_cols:
+                self._conn.execute(
+                    "ALTER TABLE psc_payments ADD COLUMN gateway_payment_id TEXT")
             self._conn.commit()
             # Migrate psc_users: banned column + canonical emails + unique index.
             cols = [r[1] for r in self._conn.execute(
@@ -406,63 +425,64 @@ class SQLiteStore:
                 "SELECT * FROM psc_license_keys ORDER BY created_at DESC").fetchall()
         return [dict(r) for r in rows]
 
-    def create_payment(self, payment_id, install_id, plan, amount):
-        """A checkout the app started: pending until the gateway reports
-        it paid. payment_id is the gateway's public id (unique per
-        purchase)."""
+    def create_payment(self, purchase_ref, install_id, plan, amount):
+        """A checkout the app started: pending until the gateway's
+        webhook reports it paid. purchase_ref is generated HERE and is
+        the row's key; the gateway's payment id is unknown until the
+        callback arrives."""
         with self._lock:
             self._conn.execute(
-                "INSERT INTO psc_payments (payment_id, install_id, plan, amount, status, key_id, created_at, paid_at)"
-                " VALUES (?, ?, ?, ?, 'pending', NULL, ?, NULL)",
-                (payment_id, install_id, plan, amount, _now_iso()))
+                "INSERT INTO psc_payments (purchase_ref, gateway_payment_id, install_id, plan, amount, status, key_id, created_at, paid_at)"
+                " VALUES (?, NULL, ?, ?, ?, 'pending', NULL, ?, NULL)",
+                (purchase_ref, install_id, plan, amount, _now_iso()))
             self._conn.commit()
 
-    def get_payment(self, payment_id):
+    def get_payment_by_ref(self, purchase_ref):
         with self._lock:
             row = self._conn.execute(
-                "SELECT * FROM psc_payments WHERE payment_id = ?",
-                (payment_id,)).fetchone()
+                "SELECT * FROM psc_payments WHERE purchase_ref = ?",
+                (purchase_ref,)).fetchone()
         return dict(row) if row else None
 
-    def claim_payment(self, payment_id):
+    def claim_payment(self, purchase_ref):
         """Atomically flip a pending row to `issuing`. Returns True only
-        for the ONE caller that won the claim — concurrent status checks
-        for the same payment can never both issue a key."""
+        for the ONE caller that won the claim — concurrent callbacks
+        for the same purchase can never both issue a key."""
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE psc_payments SET status = 'issuing'"
-                " WHERE payment_id = ? AND status = 'pending'",
-                (payment_id,))
+                " WHERE purchase_ref = ? AND status = 'pending'",
+                (purchase_ref,))
             self._conn.commit()
             return cur.rowcount > 0
 
-    def set_payment_paid(self, payment_id, key_id):
-        """Mark the purchase paid + record the issued key. Called once,
-        right after the key is created and bound."""
+    def set_payment_paid(self, purchase_ref, key_id, gateway_payment_id):
+        """Mark the purchase paid + record the issued key and the
+        gateway's payment id. Called once, right after the key is
+        created and bound."""
         with self._lock:
             self._conn.execute(
-                "UPDATE psc_payments SET status = 'paid', key_id = ?, paid_at = ?"
-                " WHERE payment_id = ?",
-                (key_id, _now_iso(), payment_id))
+                "UPDATE psc_payments SET status = 'paid', key_id = ?, gateway_payment_id = ?, paid_at = ?"
+                " WHERE purchase_ref = ?",
+                (key_id, gateway_payment_id, _now_iso(), purchase_ref))
             self._conn.commit()
 
-    def set_payment_failed(self, payment_id):
-        """Terminal failure (gateway reported failed/expired/cancelled).
-        The shopkeeper must start a fresh purchase."""
+    def set_payment_failed(self, purchase_ref):
+        """Terminal failure. The shopkeeper must start a fresh purchase."""
         with self._lock:
             self._conn.execute(
-                "UPDATE psc_payments SET status = 'failed' WHERE payment_id = ?",
-                (payment_id,))
+                "UPDATE psc_payments SET status = 'failed' WHERE purchase_ref = ?",
+                (purchase_ref,))
             self._conn.commit()
 
-    def reset_payment_pending(self, payment_id):
+    def reset_payment_pending(self, purchase_ref):
         """Release an `issuing` claim (issuance crashed mid-way) so the
-        next status check retries instead of stalling forever."""
+        next callback retries instead of stalling forever."""
         with self._lock:
             self._conn.execute(
                 "UPDATE psc_payments SET status = 'pending'"
-                " WHERE payment_id = ? AND status = 'issuing'",
-                (payment_id,))
+                " WHERE purchase_ref = ? AND status = 'issuing'",
+                (purchase_ref,))
             self._conn.commit()
 
     def get_key_by_id(self, key_id):
@@ -528,6 +548,17 @@ class PostgresStore:
                     "ALTER TABLE psc_license_keys ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'lifetime'")
                 cur.execute(
                     "ALTER TABLE psc_license_keys ADD COLUMN IF NOT EXISTS expires_at INTEGER")
+            conn.commit()
+            # Migrate psc_payments (webhook redesign): rows are keyed by
+            # purchase_ref (generated here) + the gateway's payment id
+            # arrives later via the callback. Fresh DBs get both columns
+            # from CREATE TABLE; this covers a DB created by the
+            # never-deployed direct-call build (payment_id PK schema).
+            with conn.cursor() as cur:
+                cur.execute(
+                    "ALTER TABLE psc_payments ADD COLUMN IF NOT EXISTS purchase_ref TEXT")
+                cur.execute(
+                    "ALTER TABLE psc_payments ADD COLUMN IF NOT EXISTS gateway_payment_id TEXT")
             conn.commit()
             # Migrate psc_users: banned column + canonical emails.
             with conn.cursor() as cur:
@@ -819,86 +850,87 @@ class PostgresStore:
         finally:
             conn.close()
 
-    def create_payment(self, payment_id, install_id, plan, amount):
-        """A checkout the app started: pending until the gateway reports
-        it paid. payment_id is the gateway's public id (unique per
-        purchase)."""
+    def create_payment(self, purchase_ref, install_id, plan, amount):
+        """A checkout the app started: pending until the gateway's
+        webhook reports it paid. purchase_ref is generated HERE and is
+        the row's key; the gateway's payment id is unknown until the
+        callback arrives."""
         conn = self._connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO psc_payments (payment_id, install_id, plan, amount, status, key_id, created_at, paid_at)"
-                    " VALUES (%s, %s, %s, %s, 'pending', NULL, %s, NULL)",
-                    (payment_id, install_id, plan, amount, _now_iso()))
+                    "INSERT INTO psc_payments (purchase_ref, gateway_payment_id, install_id, plan, amount, status, key_id, created_at, paid_at)"
+                    " VALUES (%s, NULL, %s, %s, %s, 'pending', NULL, %s, NULL)",
+                    (purchase_ref, install_id, plan, amount, _now_iso()))
             conn.commit()
         finally:
             conn.close()
 
-    def get_payment(self, payment_id):
+    def get_payment_by_ref(self, purchase_ref):
         conn = self._connect()
         try:
             with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
-                cur.execute("SELECT * FROM psc_payments WHERE payment_id = %s",
-                            (payment_id,))
+                cur.execute("SELECT * FROM psc_payments WHERE purchase_ref = %s",
+                            (purchase_ref,))
                 row = cur.fetchone()
             return dict(row) if row else None
         finally:
             conn.close()
 
-    def claim_payment(self, payment_id):
+    def claim_payment(self, purchase_ref):
         """Atomically flip a pending row to `issuing`. Returns True only
-        for the ONE caller that won the claim — concurrent status checks
-        for the same payment can never both issue a key."""
+        for the ONE caller that won the claim — concurrent callbacks
+        for the same purchase can never both issue a key."""
         conn = self._connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE psc_payments SET status = 'issuing'"
-                    " WHERE payment_id = %s AND status = 'pending'",
-                    (payment_id,))
+                    " WHERE purchase_ref = %s AND status = 'pending'",
+                    (purchase_ref,))
                 claimed = cur.rowcount > 0
             conn.commit()
             return claimed
         finally:
             conn.close()
 
-    def set_payment_paid(self, payment_id, key_id):
-        """Mark the purchase paid + record the issued key. Called once,
-        right after the key is created and bound."""
+    def set_payment_paid(self, purchase_ref, key_id, gateway_payment_id):
+        """Mark the purchase paid + record the issued key and the
+        gateway's payment id. Called once, right after the key is
+        created and bound."""
         conn = self._connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE psc_payments SET status = 'paid', key_id = %s, paid_at = %s"
-                    " WHERE payment_id = %s",
-                    (key_id, _now_iso(), payment_id))
+                    "UPDATE psc_payments SET status = 'paid', key_id = %s, gateway_payment_id = %s, paid_at = %s"
+                    " WHERE purchase_ref = %s",
+                    (key_id, gateway_payment_id, _now_iso(), purchase_ref))
             conn.commit()
         finally:
             conn.close()
 
-    def set_payment_failed(self, payment_id):
-        """Terminal failure (gateway reported failed/expired/cancelled).
-        The shopkeeper must start a fresh purchase."""
+    def set_payment_failed(self, purchase_ref):
+        """Terminal failure. The shopkeeper must start a fresh purchase."""
         conn = self._connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "UPDATE psc_payments SET status = 'failed' WHERE payment_id = %s",
-                    (payment_id,))
+                    "UPDATE psc_payments SET status = 'failed' WHERE purchase_ref = %s",
+                    (purchase_ref,))
             conn.commit()
         finally:
             conn.close()
 
-    def reset_payment_pending(self, payment_id):
+    def reset_payment_pending(self, purchase_ref):
         """Release an `issuing` claim (issuance crashed mid-way) so the
-        next status check retries instead of stalling forever."""
+        next callback retries instead of stalling forever."""
         conn = self._connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE psc_payments SET status = 'pending'"
-                    " WHERE payment_id = %s AND status = 'issuing'",
-                    (payment_id,))
+                    " WHERE purchase_ref = %s AND status = 'issuing'",
+                    (purchase_ref,))
             conn.commit()
         finally:
             conn.close()
