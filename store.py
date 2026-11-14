@@ -86,10 +86,19 @@ CREATE TABLE IF NOT EXISTS psc_license_keys (
     install_id  TEXT,
     user_id     TEXT,
     created_at  TEXT NOT NULL,
-    activated_at TEXT
+    activated_at TEXT,
+    plan        TEXT NOT NULL DEFAULT 'lifetime',
+    expires_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_psc_license_key ON psc_license_keys(license_key);
 """
+# Subscription plans (v3.4.0 server): a key carries a plan + an expiry.
+# plan: 'monthly' (30 days) | 'yearly' (365 days) | 'lifetime' (no expiry).
+# expires_at is unix seconds, NULL = lifetime. Legacy rows (created before
+# these columns existed) get plan 'lifetime' + NULL expiry via migration,
+# so they behave exactly as before. Expiry is set at FIRST bind (activate),
+# never at key creation — a key bought today but activated next month
+# still gets its full term.
 
 SCHEMA_USERS = """
 CREATE TABLE IF NOT EXISTS psc_users (
@@ -172,6 +181,18 @@ class SQLiteStore:
                     ALTER TABLE psc_trials_new RENAME TO psc_trials;
                 """)
                 self._conn.commit()
+            # Migrate psc_license_keys (v3.4.0): plan + expires_at columns.
+            # Legacy rows get plan 'lifetime' + NULL expiry = lifetime,
+            # exactly their old behavior.
+            key_cols = [r[1] for r in self._conn.execute(
+                "PRAGMA table_info('psc_license_keys')").fetchall()]
+            if 'plan' not in key_cols:
+                self._conn.execute(
+                    "ALTER TABLE psc_license_keys ADD COLUMN plan TEXT NOT NULL DEFAULT 'lifetime'")
+            if 'expires_at' not in key_cols:
+                self._conn.execute(
+                    "ALTER TABLE psc_license_keys ADD COLUMN expires_at INTEGER")
+            self._conn.commit()
             # Migrate psc_users: banned column + canonical emails + unique index.
             cols = [r[1] for r in self._conn.execute(
                 "PRAGMA table_info('psc_users')").fetchall()]
@@ -315,12 +336,12 @@ class SQLiteStore:
                 (user_id,)).fetchone()
         return dict(row) if row else None
 
-    def create_key(self, key_id, license_key, install_id):
+    def create_key(self, key_id, license_key, install_id, plan='lifetime'):
         with self._lock:
             self._conn.execute(
-                "INSERT INTO psc_license_keys (key_id, license_key, install_id, user_id, created_at, activated_at)"
-                " VALUES (?, ?, ?, NULL, ?, NULL)",
-                (key_id, _norm_key(license_key), install_id, _now_iso()))
+                "INSERT INTO psc_license_keys (key_id, license_key, install_id, user_id, created_at, activated_at, plan, expires_at)"
+                " VALUES (?, ?, ?, NULL, ?, NULL, ?, NULL)",
+                (key_id, _norm_key(license_key), install_id, _now_iso(), plan))
             self._conn.commit()
 
     def get_key(self, license_key):
@@ -336,6 +357,27 @@ class SQLiteStore:
                 "UPDATE psc_license_keys SET install_id = ?, activated_at = ? WHERE key_id = ?",
                 (install_id, _now_iso(), key_id))
             self._conn.commit()
+
+    def set_key_expiry(self, key_id, expires_at):
+        """Set the expiry (unix seconds, or None = lifetime) of a key.
+        Called once at first bind; re-activating the same key never
+        touches it again, so time can never be extended by re-entry."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE psc_license_keys SET expires_at = ? WHERE key_id = ?",
+                (expires_at, key_id))
+            self._conn.commit()
+
+    def list_keys_by_install_id(self, install_id):
+        """All keys bound to one device (oldest first) — used to stack a
+        renewal onto the device's latest expiry and to detect a lifetime
+        key, which blocks any further key on that device."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM psc_license_keys WHERE install_id = ?"
+                " ORDER BY created_at ASC, key_id ASC",
+                (install_id,)).fetchall()
+        return [dict(r) for r in rows]
 
     def list_keys(self):
         with self._lock:
@@ -389,6 +431,15 @@ class PostgresStore:
                         cur.execute(_sql.SQL("ALTER TABLE psc_trials DROP CONSTRAINT {}").format(
                             _sql.Identifier(pkrow[0])))
                         cur.execute("ALTER TABLE psc_trials ADD PRIMARY KEY (user_id)")
+            conn.commit()
+            # Migrate psc_license_keys (v3.4.0): plan + expires_at columns.
+            # Legacy rows get plan 'lifetime' + NULL expiry = lifetime,
+            # exactly their old behavior.
+            with conn.cursor() as cur:
+                cur.execute(
+                    "ALTER TABLE psc_license_keys ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'lifetime'")
+                cur.execute(
+                    "ALTER TABLE psc_license_keys ADD COLUMN IF NOT EXISTS expires_at INTEGER")
             conn.commit()
             # Migrate psc_users: banned column + canonical emails.
             with conn.cursor() as cur:
@@ -609,14 +660,14 @@ class PostgresStore:
         conn.autocommit = False
         return conn
 
-    def create_key(self, key_id, license_key, install_id):
+    def create_key(self, key_id, license_key, install_id, plan='lifetime'):
         conn = self._connect()
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO psc_license_keys (key_id, license_key, install_id, user_id, created_at, activated_at)"
-                    " VALUES (%s, %s, %s, NULL, %s, NULL)",
-                    (key_id, _norm_key(license_key), install_id, _now_iso()))
+                    "INSERT INTO psc_license_keys (key_id, license_key, install_id, user_id, created_at, activated_at, plan, expires_at)"
+                    " VALUES (%s, %s, %s, NULL, %s, NULL, %s, NULL)",
+                    (key_id, _norm_key(license_key), install_id, _now_iso(), plan))
             conn.commit()
         finally:
             conn.close()
@@ -640,6 +691,34 @@ class PostgresStore:
                     "UPDATE psc_license_keys SET install_id = %s, activated_at = %s WHERE key_id = %s",
                     (install_id, _now_iso(), key_id))
             conn.commit()
+        finally:
+            conn.close()
+
+    def set_key_expiry(self, key_id, expires_at):
+        """Set the expiry (unix seconds, or None = lifetime) of a key.
+        Called once at first bind; re-activating the same key never
+        touches it again, so time can never be extended by re-entry."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE psc_license_keys SET expires_at = %s WHERE key_id = %s",
+                    (expires_at, key_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_keys_by_install_id(self, install_id):
+        """All keys bound to one device (oldest first) — used to stack a
+        renewal onto the device's latest expiry and to detect a lifetime
+        key, which blocks any further key on that device."""
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM psc_license_keys WHERE install_id = %s"
+                            " ORDER BY created_at ASC, key_id ASC",
+                            (install_id,))
+                return [dict(r) for r in cur.fetchall()]
         finally:
             conn.close()
 

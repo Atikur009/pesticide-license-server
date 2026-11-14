@@ -11,8 +11,8 @@ locally with the embedded public key.
 | Method | Path | Auth | Description |
 |---|---|---|---|
 | GET | `/health` | — | `{"status":"ok"}` |
-| POST | `/v1/register-key` | `X-Admin-Secret` | Body `{"install_id"?}` → creates a key, returns `{"key_id","key","install_id"}`. Used by keygen.html. |
-| POST | `/v1/activate` | — | Body `{"install_id","key"}` → validates, binds key to install_id on first use, rejects if bound elsewhere. Returns `{"token","install_id","key_id"}`. |
+| POST | `/v1/register-key` | `X-Admin-Secret` | Body `{"install_id"?, "plan"?}` → creates a key, returns `{"key_id","key","plan","install_id"}`. `plan`: `monthly` (30 days) \| `yearly` (365 days) \| `lifetime` (default, no expiry). Used by keygen.html. |
+| POST | `/v1/activate` | — | Body `{"install_id","key"}` → validates, binds key to install_id on first use, rejects if bound elsewhere. Returns `{"token","install_id","key_id","plan","expires_at","days_left"}`. Renewal keys stack onto the device's latest expiry; re-entering the same key returns its stored expiry; a lifetime device rejects new keys (409). |
 | POST | `/v1/signup` | — | Body `{"full_name","phone","post_office","email","password"}` → emails a 6-digit code; account created by verify-signup. One account per Gmail (canonical mailbox form). |
 | POST | `/v1/verify-signup` | — | Body `{"email","code"}` → creates the account, returns a 30-day session token. |
 | POST | `/v1/login` | — | Body `{"email","password?","phone?"}` → password accounts need the password, legacy accounts need the phone; then emails a code. |

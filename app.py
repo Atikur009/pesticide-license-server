@@ -6,12 +6,26 @@ the server's signed activation token offline afterwards.
 
 Endpoints (all JSON):
   GET  /health                  -> {status, version, store}
-  POST /v1/register-key         -> admin only (X-Admin-Secret). {install_id?}
-                                   creates a random key, returns {key, key_id}.
+  POST /v1/register-key         -> admin only (X-Admin-Secret). {install_id?,
+                                   plan?} creates a random key, returns
+                                   {key, key_id, plan}. plan is monthly |
+                                   yearly | lifetime (default lifetime).
+                                   Expiry is NOT set here — it starts at
+                                   first activation (see /v1/activate).
   POST /v1/activate             -> {install_id, key}. Binds the key to that
                                    install_id on first use; rejects a key
                                    already bound to a different install_id.
-                                   Returns {token, key_id, install_id}.
+                                   Subscription plans (v3.4.0): monthly =
+                                   30 days, yearly = 365 days, lifetime =
+                                   no expiry. A renewal key on the same
+                                   device EXTENDS from the device's latest
+                                   expiry (never from "now" when time is
+                                   left); re-entering the SAME key returns
+                                   its STORED expiry and never extends it.
+                                   A device with a lifetime key rejects any
+                                   further key (409 already_licensed).
+                                   Returns {token, key_id, install_id,
+                                   plan, expires_at, days_left}.
   POST /v1/signup               -> {full_name, phone, post_office, email,
                                    password}. Validates and EMAILS a 6-digit
                                    code; the account is created only when the
@@ -56,7 +70,11 @@ Endpoints (all JSON):
   GET  /v1/export               -> admin only. Full JSON backup dump.
 
 Token: base64url(payload) + "." + base64url(RSA-PKCS1v1.5-SHA256 signature)
-payload = {"install_id": ..., "key_id": ..., "iat": <unix seconds>}.
+payload = {"install_id": ..., "key_id": ..., "iat": <unix seconds>,
+           "type": "license", "plan": "monthly"|"yearly"|"lifetime",
+           "exp": <unix seconds>}. "exp" is present only for term plans
+(monthly/yearly); lifetime tokens carry NO exp and never expire. Tokens
+issued before v3.4.0 have no "plan"/"exp" and are treated as lifetime.
 The client verifies the signature with the embedded RSA public key and
 checks payload.install_id == its own Install ID. No network needed after
 activation.
@@ -95,8 +113,12 @@ from flask import Flask, jsonify, request
 import mailer
 from store import canon_email, get_store
 
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 KEY_ALPHABET = string.ascii_uppercase + string.digits
+# Subscription plans (v3.4.0): term in seconds, None = lifetime (no expiry).
+# Prices live in the app/keygen UI only ($2 monthly, $20 yearly, $100
+# lifetime) — the server only knows terms, never money.
+PLANS = {"monthly": 30 * 86400, "yearly": 365 * 86400, "lifetime": None}
 TRIAL_DAYS = 3
 TRIAL_SECONDS = TRIAL_DAYS * 86400
 SESSION_DAYS = 30
@@ -378,19 +400,37 @@ def health():
     return jsonify({"status": "ok", "version": VERSION, "store": store.backend})
 
 
+def _days_left(expires_at, now):
+    """Whole days left until expiry, rounded UP (any part of a day counts
+    as a day, like the trial display). None = lifetime, 0 = expired."""
+    if expires_at is None:
+        return None
+    return max(0, (int(expires_at) - int(now) + 86399) // 86400)
+
+
+def _key_plan(rec):
+    """A key row's plan; legacy rows (no plan stored) are lifetime."""
+    plan = (rec or {}).get("plan") or "lifetime"
+    return plan if plan in PLANS else "lifetime"
+
+
 @app.route("/v1/register-key", methods=["POST"])
 def register_key():
     if not _admin_ok():
         return jsonify({"error": "unauthorized"}), 401
     body = request.get_json(silent=True) or {}
     install_id = (body.get("install_id") or "").strip().upper() or None
+    plan = str(body.get("plan") or "lifetime").strip().lower()
+    if plan not in PLANS:
+        return jsonify({"error": "invalid_plan",
+                        "message": "প্ল্যান সঠিক নয় — monthly, yearly বা lifetime হতে হবে।"}), 400
     key_id = _new_key_id()
     key = _new_key()
     # Extremely unlikely collision — retry once if the key already exists.
     if store.get_key(key):
         key = _new_key()
-    store.create_key(key_id, key, install_id)
-    return jsonify({"key": key, "key_id": key_id,
+    store.create_key(key_id, key, install_id, plan)
+    return jsonify({"key": key, "key_id": key_id, "plan": plan,
                     "install_id": install_id, "bound": bool(install_id)}), 201
 
 
@@ -413,11 +453,47 @@ def activate():
     if bound and bound != install_id:
         return jsonify({"error": "bound_other_device",
                         "message": "এই কী অন্য একটি ডিভাইসে ব্যবহৃত হয়েছে।"}), 403
-    if not bound:
+    plan = _key_plan(rec)
+    term = PLANS[plan]
+    now = int(time.time())
+    if bound:
+        # Same key, same device: return the STORED expiry — re-entering a
+        # key must NEVER extend time (even after expiry; the client then
+        # shows "expired" and the shopkeeper buys a renewal key).
+        expires_at = rec.get("expires_at")
+        if term is not None and expires_at is None:
+            # Anomalous row (term plan, no expiry stored — cannot happen
+            # through this code, only by manual DB edits): repair once
+            # from now, then the stored value rules forever after.
+            expires_at = now + term
+            store.set_key_expiry(rec["key_id"], expires_at)
+    else:
+        # Fresh bind. A lifetime device needs no further key, ever.
+        for other in store.list_keys_by_install_id(install_id):
+            if _key_plan(other) == "lifetime":
+                return jsonify({"error": "already_licensed",
+                                "message": "এই ডিভাইসে লাইফটাইম লাইসেন্স আছে — নতুন কী লাগবে না।"}), 409
+        if term is None:
+            expires_at = None
+        else:
+            # Renewal stacks onto the device's latest expiry when time is
+            # left (a key bought early loses nothing); an expired device
+            # starts fresh from now.
+            base = now
+            for other in store.list_keys_by_install_id(install_id):
+                other_exp = other.get("expires_at")
+                if other_exp is not None and int(other_exp) > base:
+                    base = int(other_exp)
+            expires_at = base + term
         store.bind_key(rec["key_id"], install_id)
-    token = sign_token(install_id, rec["key_id"])
+        if term is not None:
+            store.set_key_expiry(rec["key_id"], expires_at)
+    token = sign_token(install_id, rec["key_id"],
+                       exp=expires_at, extra={"plan": plan})
     return jsonify({"token": token, "key_id": rec["key_id"],
-                    "install_id": install_id})
+                    "install_id": install_id, "plan": plan,
+                    "expires_at": expires_at,
+                    "days_left": _days_left(expires_at, now)})
 
 
 @app.route("/v1/signup", methods=["POST"])
