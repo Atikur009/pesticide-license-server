@@ -26,6 +26,25 @@ Endpoints (all JSON):
                                    further key (409 already_licensed).
                                    Returns {token, key_id, install_id,
                                    plan, expires_at, days_left}.
+  POST /v1/purchase             -> {install_id, plan}. AUTO-BUY (Atikur Pay
+                                   gateway): creates a gateway checkout for
+                                   the plan's BDT price and returns
+                                   {payment_id, payment_url, amount,
+                                   currency: "BDT", plan, status}. The
+                                   shopkeeper pays on the gateway page
+                                   (bKash + TrxID, SMS-verified by the
+                                   gateway) — no key typing. A lifetime
+                                   device gets 409 already_licensed.
+  POST /v1/purchase/status      -> {payment_id}. Asks the gateway whether
+                                   the payment is paid. pending -> {status:
+                                   "pending"}; paid -> the key is issued
+                                   server-side (same stacking rules as
+                                   /v1/activate) and the EXACT activate
+                                   response is returned; repeat calls return
+                                   the SAME stored activation (never a second
+                                   key). failed/expired/cancelled -> {status:
+                                   "failed"} (terminal). No session needed —
+                                   the payment is the authorization.
   POST /v1/signup               -> {full_name, phone, post_office, email,
                                    password}. Validates and EMAILS a 6-digit
                                    code; the account is created only when the
@@ -92,6 +111,16 @@ Secrets (Render env vars, NEVER in the repo):
   SMTP_USER / SMTP_APP_PASSWORD — Gmail address + app password that sends
                           the verification codes (see mailer.py). Without
                           them the auth endpoints report email_unconfigured.
+  ATIKUR_PAY_API_KEY        — merchant API key for the Atikur Pay gateway
+                          (created in the gateway dashboard for the
+                          pesticide app). Without it /v1/purchase* report
+                          gateway_not_configured (503).
+  ATIKUR_PAY_BASE_URL       — gateway base URL (default
+                          https://atikur-pay.onrender.com).
+  PLAN_PRICES_BDT           — optional JSON override of the plan prices in
+                          BDT, e.g. {"monthly":250,"yearly":2500,
+                          "lifetime":12500} (the defaults). The server is
+                          the ONLY place that knows BDT prices.
 
 Next phase (NOT built here): shopkeeper accounts + cloud sync. The schema
 already has psc_users + psc_license_keys.user_id, and routes are /v1/ versioned, so
@@ -106,6 +135,9 @@ import re
 import secrets
 import string
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import defaultdict
 
 from flask import Flask, jsonify, request
@@ -119,6 +151,31 @@ KEY_ALPHABET = string.ascii_uppercase + string.digits
 # Prices live in the app/keygen UI only ($2 monthly, $20 yearly, $100
 # lifetime) — the server only knows terms, never money.
 PLANS = {"monthly": 30 * 86400, "yearly": 365 * 86400, "lifetime": None}
+# Auto-buy (Atikur Pay): BDT prices charged on the gateway checkout page.
+# The server is the ONLY place that knows BDT prices — the app displays
+# whatever /v1/purchase returns. Override via PLAN_PRICES_BDT (JSON).
+DEFAULT_PLAN_PRICES_BDT = {"monthly": 250, "yearly": 2500, "lifetime": 12500}
+ATIKUR_PAY_BASE_URL = os.environ.get(
+    "ATIKUR_PAY_BASE_URL", "https://atikur-pay.onrender.com").rstrip("/")
+ATIKUR_PAY_API_KEY = os.environ.get("ATIKUR_PAY_API_KEY") or None
+
+
+def _plan_prices_bdt():
+    """BDT price per plan: defaults, overridden per-plan by the
+    PLAN_PRICES_BDT env JSON. A bad override never breaks the server —
+    invalid entries fall back to the defaults."""
+    prices = dict(DEFAULT_PLAN_PRICES_BDT)
+    raw = os.environ.get("PLAN_PRICES_BDT")
+    if raw:
+        try:
+            override = json.loads(raw)
+        except ValueError:
+            override = None
+        if isinstance(override, dict):
+            for plan, amount in override.items():
+                if plan in prices and isinstance(amount, (int, float)) and amount >= 1:
+                    prices[plan] = int(amount)
+    return prices
 TRIAL_DAYS = 3
 TRIAL_SECONDS = TRIAL_DAYS * 86400
 SESSION_DAYS = 30
@@ -273,6 +330,36 @@ def _new_session(user_id, email):
                           "exp": now + SESSION_SECONDS})
 
 
+# ------------------------------------------------------- Atikur Pay client --
+class _GatewayError(Exception):
+    """The gateway could not be reached or answered garbage. Never carries
+    the API key — nothing about a gateway call is ever logged."""
+
+
+def _gateway_request(method, path, body=None):
+    """One merchant-API call to Atikur Pay (server-to-server, stdlib
+    urllib only). Returns (http_status, parsed_json). Raises
+    _GatewayError on network failure or a non-JSON answer."""
+    url = ATIKUR_PAY_BASE_URL + path
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("X-API-Key", ATIKUR_PAY_API_KEY)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        # The gateway answered with an error status — its JSON body (if
+        # any) is still useful to the caller.
+        try:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            return exc.code, {}
+    except Exception:
+        raise _GatewayError()
+
+
 # ------------------------------------------------------- passwords + OTP --
 def _hash_password(password):
     salt = secrets.token_bytes(16)
@@ -414,6 +501,42 @@ def _key_plan(rec):
     return plan if plan in PLANS else "lifetime"
 
 
+def _device_has_lifetime(install_id):
+    """True when any key bound to this device is lifetime — such a device
+    needs no further key, ever (same rule for manual keys and auto-buy)."""
+    for other in store.list_keys_by_install_id(install_id):
+        if _key_plan(other) == "lifetime":
+            return True
+    return False
+
+
+def _compute_expiry(store, install_id, plan, now):
+    """Expiry (unix seconds, None = lifetime) for a FRESH key bind on a
+    device: a renewal stacks onto the device's latest expiry when time is
+    left (a key bought early loses nothing); an expired device starts
+    fresh from now. Shared by /v1/activate and /v1/purchase/status so the
+    two paths can never diverge."""
+    term = PLANS[plan]
+    if term is None:
+        return None
+    base = now
+    for other in store.list_keys_by_install_id(install_id):
+        other_exp = other.get("expires_at")
+        if other_exp is not None and int(other_exp) > base:
+            base = int(other_exp)
+    return base + term
+
+
+def _issue_activation(install_id, key_id, plan, expires_at, now):
+    """The activation response shape — identical for a manual key and an
+    auto-buy purchase. The token carries plan + exp (term plans only)."""
+    token = sign_token(install_id, key_id,
+                       exp=expires_at, extra={"plan": plan})
+    return {"token": token, "key_id": key_id, "install_id": install_id,
+            "plan": plan, "expires_at": expires_at,
+            "days_left": _days_left(expires_at, now)}
+
+
 @app.route("/v1/register-key", methods=["POST"])
 def register_key():
     if not _admin_ok():
@@ -469,31 +592,154 @@ def activate():
             store.set_key_expiry(rec["key_id"], expires_at)
     else:
         # Fresh bind. A lifetime device needs no further key, ever.
-        for other in store.list_keys_by_install_id(install_id):
-            if _key_plan(other) == "lifetime":
-                return jsonify({"error": "already_licensed",
-                                "message": "এই ডিভাইসে লাইফটাইম লাইসেন্স আছে — নতুন কী লাগবে না।"}), 409
-        if term is None:
-            expires_at = None
-        else:
-            # Renewal stacks onto the device's latest expiry when time is
-            # left (a key bought early loses nothing); an expired device
-            # starts fresh from now.
-            base = now
-            for other in store.list_keys_by_install_id(install_id):
-                other_exp = other.get("expires_at")
-                if other_exp is not None and int(other_exp) > base:
-                    base = int(other_exp)
-            expires_at = base + term
+        if _device_has_lifetime(install_id):
+            return jsonify({"error": "already_licensed",
+                            "message": "এই ডিভাইসে লাইফটাইম লাইসেন্স আছে — নতুন কী লাগবে না।"}), 409
+        expires_at = _compute_expiry(store, install_id, plan, now)
         store.bind_key(rec["key_id"], install_id)
         if term is not None:
             store.set_key_expiry(rec["key_id"], expires_at)
-    token = sign_token(install_id, rec["key_id"],
-                       exp=expires_at, extra={"plan": plan})
-    return jsonify({"token": token, "key_id": rec["key_id"],
-                    "install_id": install_id, "plan": plan,
-                    "expires_at": expires_at,
-                    "days_left": _days_left(expires_at, now)})
+    return jsonify(_issue_activation(install_id, rec["key_id"], plan,
+                                     expires_at, now))
+
+
+@app.route("/v1/purchase", methods=["POST"])
+def purchase():
+    """Auto-buy step 1: create an Atikur Pay checkout for the plan's BDT
+    price. The app opens payment_url; the shopkeeper pays there (bKash
+    Send Money + TrxID, SMS-verified by the gateway). No session needed
+    — creating a checkout moves no money. Deliberately NOT rate-limited:
+    the companion status endpoint is polled every 10s and must never hit
+    the 30/10min activation guard."""
+    if not ATIKUR_PAY_API_KEY:
+        return jsonify({"error": "gateway_not_configured",
+                        "message": "অটোমেটিক পেমেন্ট চালু হয়নি — অ্যাডমিনের সাথে যোগাযোগ করুন।"}), 503
+    body = request.get_json(silent=True) or {}
+    install_id = (body.get("install_id") or "").strip().upper()
+    plan = str(body.get("plan") or "").strip().lower()
+    if not install_id:
+        return jsonify({"error": "missing_fields",
+                        "message": "Install ID লাগবে।"}), 400
+    if plan not in PLANS:
+        return jsonify({"error": "invalid_plan",
+                        "message": "প্ল্যান সঠিক নয় — monthly, yearly বা lifetime হতে হবে।"}), 400
+    if _device_has_lifetime(install_id):
+        return jsonify({"error": "already_licensed",
+                        "message": "এই ডিভাইসে লাইফটাইম লাইসেন্স আছে — নতুন কী লাগবে না।"}), 409
+    amount = _plan_prices_bdt()[plan]
+    invoice = "PSC-%s-%s-%d-%s" % (
+        plan, install_id, int(time.time()),
+        "".join(secrets.choice(KEY_ALPHABET) for _ in range(6)))
+    try:
+        status_code, data = _gateway_request(
+            "POST", "/api/v1/create-payment",
+            {"amount": amount, "currency": "BDT",
+             "merchantInvoiceNumber": invoice, "customerRef": install_id})
+    except _GatewayError:
+        return jsonify({"error": "gateway_error",
+                        "message": "পেমেন্ট সার্ভারে যোগাযোগ হয়নি — আবার চেষ্টা করুন।"}), 502
+    if status_code not in (200, 201) or not data.get("payment_id") or not data.get("payment_url"):
+        return jsonify({"error": "gateway_error",
+                        "message": "পেমেন্ট তৈরি হয়নি — আবার চেষ্টা করুন।"}), 502
+    store.create_payment(data["payment_id"], install_id, plan, amount)
+    return jsonify({"payment_id": data["payment_id"],
+                    "payment_url": data["payment_url"],
+                    "amount": amount, "currency": "BDT", "plan": plan,
+                    "status": "pending"}), 201
+
+
+@app.route("/v1/purchase/status", methods=["POST"])
+def purchase_status():
+    """Auto-buy step 2: ask the gateway whether the payment is paid. A
+    paid payment issues the license key server-side (same stacking rules
+    as /v1/activate) and returns the EXACT activate response; repeat
+    calls return the SAME stored activation — one payment, one key,
+    forever. No session needed — the payment is the authorization."""
+    if not ATIKUR_PAY_API_KEY:
+        return jsonify({"error": "gateway_not_configured",
+                        "message": "অটোমেটিক পেমেন্ট চালু হয়নি — অ্যাডমিনের সাথে যোগাযোগ করুন।"}), 503
+    body = request.get_json(silent=True) or {}
+    payment_id = str(body.get("payment_id") or "").strip()
+    if not payment_id:
+        return jsonify({"error": "missing_fields",
+                        "message": "payment_id লাগবে।"}), 400
+    row = store.get_payment(payment_id)
+    if not row:
+        return jsonify({"error": "payment_not_found",
+                        "message": "পেমেন্টটি পাওয়া যায়নি — আবার কিনুন।"}), 404
+    if row.get("status") == "failed":
+        return jsonify({"status": "failed", "payment_id": payment_id,
+                        "plan": row.get("plan")})
+    if row.get("status") == "paid" and row.get("key_id"):
+        # Already issued: return the STORED activation — same key, same
+        # expiry, never a second key.
+        key_rec = store.get_key_by_id(row["key_id"])
+        if key_rec:
+            plan = _key_plan(key_rec)
+            return jsonify(_issue_activation(
+                row["install_id"], row["key_id"], plan,
+                key_rec.get("expires_at"), int(time.time())))
+        return jsonify({"error": "server_error",
+                        "message": "লাইসেন্স পাওয়া যায়নি — অ্যাডমিনের সাথে যোগাযোগ করুন।"}), 500
+    try:
+        status_code, data = _gateway_request(
+            "GET", "/api/v1/payment/status?payment_id=" + urllib.parse.quote(payment_id))
+    except _GatewayError:
+        return jsonify({"error": "gateway_error",
+                        "message": "পেমেন্ট সার্ভারে যোগাযোগ হয়নি — আবার চেষ্টা করুন।"}), 502
+    if status_code != 200:
+        return jsonify({"error": "gateway_error",
+                        "message": "পেমেন্ট যাচাই হয়নি — আবার চেষ্টা করুন।"}), 502
+    gw_status = str(data.get("status") or "").strip().lower()
+    if gw_status == "pending":
+        return jsonify({"status": "pending", "payment_id": payment_id,
+                        "plan": row.get("plan")})
+    if gw_status != "paid":
+        # failed / expired / cancelled / anything unknown: terminal. The
+        # gateway only ever sets pending/paid today, so this is purely
+        # defensive — a stuck checkout must never poll forever.
+        store.set_payment_failed(payment_id)
+        return jsonify({"status": "failed", "payment_id": payment_id,
+                        "plan": row.get("plan")})
+    # Paid: claim the row (exactly one issuer wins), then issue the key.
+    if not store.claim_payment(payment_id):
+        # Another check is issuing (or just issued) — re-read and answer
+        # from the stored row; the client polls again if still issuing.
+        fresh = store.get_payment(payment_id)
+        if fresh and fresh.get("status") == "paid" and fresh.get("key_id"):
+            key_rec = store.get_key_by_id(fresh["key_id"])
+            if key_rec:
+                plan = _key_plan(key_rec)
+                return jsonify(_issue_activation(
+                    fresh["install_id"], fresh["key_id"], plan,
+                    key_rec.get("expires_at"), int(time.time())))
+        return jsonify({"status": "pending", "payment_id": payment_id,
+                        "plan": row.get("plan")})
+    try:
+        now = int(time.time())
+        install_id = row["install_id"]
+        plan = row["plan"]
+        if _device_has_lifetime(install_id):
+            store.reset_payment_pending(payment_id)
+            return jsonify({"error": "already_licensed",
+                            "message": "এই ডিভাইসে লাইফটাইম লাইসেন্স আছে — নতুন কী লাগবে না।"}), 409
+        key_id = _new_key_id()
+        key = _new_key()
+        if store.get_key(key):
+            key = _new_key()
+        store.create_key(key_id, key, install_id, plan)
+        expires_at = _compute_expiry(store, install_id, plan, now)
+        store.bind_key(key_id, install_id)
+        if PLANS[plan] is not None:
+            store.set_key_expiry(key_id, expires_at)
+        store.set_payment_paid(payment_id, key_id)
+    except Exception:
+        # Never leave the row stuck in `issuing` — the next check retries.
+        store.reset_payment_pending(payment_id)
+        return jsonify({"error": "server_error",
+                        "message": "লাইসেন্স তৈরি হয়নি — আবার চেষ্টা করুন।"}), 500
+    return jsonify(_issue_activation(install_id, key_id, plan,
+                                     expires_at, now))
 
 
 @app.route("/v1/signup", methods=["POST"])

@@ -151,6 +151,27 @@ CREATE TABLE IF NOT EXISTS psc_trials (
 """
 
 
+# Auto-payment purchases (Atikur Pay gateway): one row per checkout the
+# app starts. `status` is pending until the gateway reports the payment
+# paid; the license key is then issued server-side and the row records
+# its key_id, so a repeated status check can NEVER issue a second key.
+# `issuing` is a transient claim state: the status check flips a pending
+# row to `issuing` (one atomic UPDATE) before creating the key, so two
+# concurrent checks cannot both issue. `failed` is terminal.
+SCHEMA_PAYMENTS = """
+CREATE TABLE IF NOT EXISTS psc_payments (
+    payment_id TEXT PRIMARY KEY,
+    install_id TEXT NOT NULL,
+    plan       TEXT NOT NULL,
+    amount     INTEGER NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    key_id     TEXT,
+    created_at TEXT NOT NULL,
+    paid_at    TEXT
+);
+"""
+
+
 def _now_iso():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
@@ -163,7 +184,7 @@ class SQLiteStore:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
-            self._conn.executescript(SCHEMA_KEYS + SCHEMA_USERS + SCHEMA_TRIALS + SCHEMA_VERIFICATIONS)
+            self._conn.executescript(SCHEMA_KEYS + SCHEMA_USERS + SCHEMA_TRIALS + SCHEMA_VERIFICATIONS + SCHEMA_PAYMENTS)
             self._conn.commit()
             # Migrate pre-fix trials table (PK was install_id) to PK user_id.
             row = self._conn.execute(
@@ -385,6 +406,72 @@ class SQLiteStore:
                 "SELECT * FROM psc_license_keys ORDER BY created_at DESC").fetchall()
         return [dict(r) for r in rows]
 
+    def create_payment(self, payment_id, install_id, plan, amount):
+        """A checkout the app started: pending until the gateway reports
+        it paid. payment_id is the gateway's public id (unique per
+        purchase)."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO psc_payments (payment_id, install_id, plan, amount, status, key_id, created_at, paid_at)"
+                " VALUES (?, ?, ?, ?, 'pending', NULL, ?, NULL)",
+                (payment_id, install_id, plan, amount, _now_iso()))
+            self._conn.commit()
+
+    def get_payment(self, payment_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM psc_payments WHERE payment_id = ?",
+                (payment_id,)).fetchone()
+        return dict(row) if row else None
+
+    def claim_payment(self, payment_id):
+        """Atomically flip a pending row to `issuing`. Returns True only
+        for the ONE caller that won the claim — concurrent status checks
+        for the same payment can never both issue a key."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE psc_payments SET status = 'issuing'"
+                " WHERE payment_id = ? AND status = 'pending'",
+                (payment_id,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def set_payment_paid(self, payment_id, key_id):
+        """Mark the purchase paid + record the issued key. Called once,
+        right after the key is created and bound."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE psc_payments SET status = 'paid', key_id = ?, paid_at = ?"
+                " WHERE payment_id = ?",
+                (key_id, _now_iso(), payment_id))
+            self._conn.commit()
+
+    def set_payment_failed(self, payment_id):
+        """Terminal failure (gateway reported failed/expired/cancelled).
+        The shopkeeper must start a fresh purchase."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE psc_payments SET status = 'failed' WHERE payment_id = ?",
+                (payment_id,))
+            self._conn.commit()
+
+    def reset_payment_pending(self, payment_id):
+        """Release an `issuing` claim (issuance crashed mid-way) so the
+        next status check retries instead of stalling forever."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE psc_payments SET status = 'pending'"
+                " WHERE payment_id = ? AND status = 'issuing'",
+                (payment_id,))
+            self._conn.commit()
+
+    def get_key_by_id(self, key_id):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM psc_license_keys WHERE key_id = ?",
+                (key_id,)).fetchone()
+        return dict(row) if row else None
+
     def export_all(self):
         with self._lock:
             keys = [dict(r) for r in self._conn.execute(
@@ -412,6 +499,7 @@ class PostgresStore:
                 cur.execute(SCHEMA_USERS)
                 cur.execute(SCHEMA_TRIALS)
                 cur.execute(SCHEMA_VERIFICATIONS)
+                cur.execute(SCHEMA_PAYMENTS)
             conn.commit()
             # Migrate pre-fix trials table (PK was install_id) to PK user_id.
             from psycopg2 import sql as _sql
@@ -728,6 +816,101 @@ class PostgresStore:
             with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
                 cur.execute("SELECT * FROM psc_license_keys ORDER BY created_at DESC")
                 return [dict(r) for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def create_payment(self, payment_id, install_id, plan, amount):
+        """A checkout the app started: pending until the gateway reports
+        it paid. payment_id is the gateway's public id (unique per
+        purchase)."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO psc_payments (payment_id, install_id, plan, amount, status, key_id, created_at, paid_at)"
+                    " VALUES (%s, %s, %s, %s, 'pending', NULL, %s, NULL)",
+                    (payment_id, install_id, plan, amount, _now_iso()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_payment(self, payment_id):
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM psc_payments WHERE payment_id = %s",
+                            (payment_id,))
+                row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def claim_payment(self, payment_id):
+        """Atomically flip a pending row to `issuing`. Returns True only
+        for the ONE caller that won the claim — concurrent status checks
+        for the same payment can never both issue a key."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE psc_payments SET status = 'issuing'"
+                    " WHERE payment_id = %s AND status = 'pending'",
+                    (payment_id,))
+                claimed = cur.rowcount > 0
+            conn.commit()
+            return claimed
+        finally:
+            conn.close()
+
+    def set_payment_paid(self, payment_id, key_id):
+        """Mark the purchase paid + record the issued key. Called once,
+        right after the key is created and bound."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE psc_payments SET status = 'paid', key_id = %s, paid_at = %s"
+                    " WHERE payment_id = %s",
+                    (key_id, _now_iso(), payment_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def set_payment_failed(self, payment_id):
+        """Terminal failure (gateway reported failed/expired/cancelled).
+        The shopkeeper must start a fresh purchase."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE psc_payments SET status = 'failed' WHERE payment_id = %s",
+                    (payment_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def reset_payment_pending(self, payment_id):
+        """Release an `issuing` claim (issuance crashed mid-way) so the
+        next status check retries instead of stalling forever."""
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE psc_payments SET status = 'pending'"
+                    " WHERE payment_id = %s AND status = 'issuing'",
+                    (payment_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_key_by_id(self, key_id):
+        conn = self._connect()
+        try:
+            with conn.cursor(cursor_factory=self._extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM psc_license_keys WHERE key_id = %s",
+                            (key_id,))
+                row = cur.fetchone()
+            return dict(row) if row else None
         finally:
             conn.close()
 
